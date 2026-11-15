@@ -81,7 +81,13 @@ class BoundTurn:
             )
         if parser.final_text is None:
             raise GatewayError("The gateway closed the turn without a final answer.", "rejected")
-        return {"answer": parser.final_text, "progress": list(parser.progress), "request_id": request_id}
+        evidence = _evidence(parser.evidence, agent_id, epoch)
+        return {
+            "answer": parser.final_text,
+            "progress": list(parser.progress),
+            "request_id": request_id,
+            "evidence": evidence,
+        }
 
     def _require_same_agent(self, event: dict, agent_id: str) -> None:
         other = event.get("agent_id")
@@ -104,3 +110,33 @@ class BoundTurn:
             self.client.cancel(self.token, request_id)
         except GatewayError:
             return
+
+
+def _evidence(observed: dict, agent_id: str, epoch: int) -> dict:
+    """Accept only the destination the gateway froze for this turn."""
+    if observed.get("agent_id") != agent_id or observed.get("assignment_epoch") != epoch:
+        raise GatewayError(
+            "The gateway result did not match the bound destination. The answer was discarded.",
+            "mismatch",
+        )
+    request_id = observed.get("gateway_request_id")
+    instance = observed.get("backend_instance")
+    if not isinstance(request_id, str) or not request_id.startswith("gwr_"):
+        raise GatewayError(
+            "The gateway result did not include a server request id. The answer was discarded.",
+            "rejected",
+        )
+    if not isinstance(instance, str) or not instance.startswith("bki_") or len(instance) != 36:
+        raise GatewayError(
+            "The gateway result did not include a backend instance identifier. The answer was discarded.",
+            "rejected",
+        )
+    return {
+        "agent_id": agent_id,
+        "assignment_epoch": epoch,
+        "gateway_request_id": request_id,
+        "backend_instance": instance,
+        "source": "gateway_binding",
+        "host_inspection": False,
+        "proves_answering_instance": False,
+    }

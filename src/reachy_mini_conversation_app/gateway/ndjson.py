@@ -19,6 +19,7 @@ class TurnParser:
         self.error = ""
         self.cancelled = False
         self.saw_audio = False
+        self.evidence: dict = {}
 
     def feed(self, text: str) -> list[dict]:
         self._raw += text
@@ -51,6 +52,10 @@ class TurnParser:
         return event
 
     def _observe(self, event: dict) -> None:
+        for key in ("agent_id", "assignment_epoch", "gateway_request_id", "backend_instance"):
+            value = event.get(key)
+            if value not in (None, ""):
+                self.evidence[key] = value
         kind = event.get("type")
         if kind == "response_text":
             text = event.get("text")

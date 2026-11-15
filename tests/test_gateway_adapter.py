@@ -274,7 +274,17 @@ class GatewayAdapterTests(unittest.TestCase):
             },
             chunks=[
                 _line({"type": "progress", "tool": "lookup", "preview": "working"}),
-                _line({"type": "response_text", "text": "pong", "final": True, "agent_id": "agent-a"}),
+                _line(
+                    {
+                        "type": "response_text",
+                        "text": "pong",
+                        "final": True,
+                        "agent_id": "agent-a",
+                        "assignment_epoch": 4,
+                        "gateway_request_id": "gwr_" + "ab" * 16,
+                        "backend_instance": "bki_" + "cd" * 16,
+                    }
+                ),
             ],
         )
         report = run_probe(_client(self.directory, transport), agent_id="", text="Reply with the single word pong.")
@@ -296,6 +306,10 @@ class GatewayAdapterTests(unittest.TestCase):
             ],
         )
         self.assertFalse(report["routing_evidence"]["proves_answering_instance"])
+        self.assertEqual(report["routing_evidence"]["source"], "gateway_binding")
+        self.assertEqual(report["routing_evidence"]["gateway_request_id"], "gwr_" + "ab" * 16)
+        self.assertEqual(report["routing_evidence"]["backend_instance"], "bki_" + "cd" * 16)
+        self.assertNotIn("hermes-a", json.dumps(report["routing_evidence"]))
         chat = next(body for _method, url, body, _headers, stream in transport.calls if url.endswith("/v1/chat"))
         self.assertEqual(chat["expected_agent_id"], "agent-a")
         self.assertEqual(chat["expected_epoch"], 4)
@@ -321,6 +335,24 @@ class GatewayAdapterTests(unittest.TestCase):
         with self.assertRaisesRegex(GatewayError, "backend failed") as caught:
             turn.send("ping")
         self.assertNotIn(TOKEN, str(caught.exception))
+
+    def test_answer_without_server_routing_evidence_is_discarded(self):
+        transport = ScriptTransport(
+            health={"chat_binding": 1, "text_only": True},
+            chunks=[
+                _line(
+                    {
+                        "type": "response_text",
+                        "text": "I am Hermes",
+                        "final": True,
+                        "agent_id": "agent-a",
+                        "assignment_epoch": 4,
+                    }
+                )
+            ],
+        )
+        with self.assertRaisesRegex(GatewayError, "server request id"):
+            run_probe(_client(self.directory, transport), agent_id="agent-a", text="ping")
 
     def test_audio_on_a_text_turn_is_rejected(self):
         transport = ScriptTransport(

@@ -67,6 +67,7 @@ def _run(client: GatewayClient, agent_id: str, text: str, list_only: bool) -> di
     contract = _contract(health)
     chat = {"sent": False, "answer": "", "progress": [], "blocker": ""}
     selected = None
+    evidence = None
     chosen = ""
     if list_only:
         chat["blocker"] = "List only: no destination was selected and no chat was sent."
@@ -82,6 +83,7 @@ def _run(client: GatewayClient, agent_id: str, text: str, list_only: bool) -> di
         selected = _select(client, token, chosen)
         turn = BoundTurn(client, token, selected["agent_id"], selected["epoch"])
         result = turn.send(text)
+        evidence = result["evidence"]
         chat = {"sent": True, "answer": result["answer"], "progress": result["progress"], "blocker": ""}
     report = {
         "device_id": client.identity.device_id,
@@ -93,7 +95,7 @@ def _run(client: GatewayClient, agent_id: str, text: str, list_only: bool) -> di
         "authorized_agents": agents,
         "selected_agent_id": selected["agent_id"] if selected else "",
         "assignment_epoch": selected["epoch"] if selected else None,
-        "routing_evidence": _routing(agents, selected["agent_id"] if selected else chosen),
+        "routing_evidence": evidence if evidence is not None else _no_evidence(selected["agent_id"] if selected else chosen),
         "chat": chat,
         "hermes_instance_proven": False,
     }
@@ -205,22 +207,15 @@ def _select(client: GatewayClient, token: str, agent_id: str) -> dict:
     return {"agent_id": agent_id, "epoch": epoch}
 
 
-def _routing(agents: list[dict], agent_id: str) -> dict:
-    """Registry fields returned for the agent. They do not prove a completed Hermes turn."""
-    for agent in agents:
-        if agent["id"] == agent_id:
-            return {
-                "agent_id": agent["id"],
-                "instance_id": agent["instance_id"],
-                "server_name": agent["server_name"],
-                "framework": agent["framework"],
-                "proves_answering_instance": False,
-            }
+def _no_evidence(agent_id: str) -> dict:
+    """No registry label or health flag is routing evidence."""
     return {
         "agent_id": agent_id,
-        "instance_id": "",
-        "server_name": "",
-        "framework": "",
+        "assignment_epoch": None,
+        "gateway_request_id": "",
+        "backend_instance": "",
+        "source": "none",
+        "host_inspection": False,
         "proves_answering_instance": False,
     }
 
