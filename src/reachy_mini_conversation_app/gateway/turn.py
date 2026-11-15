@@ -137,6 +137,7 @@ def _evidence(observed: dict, agent_id: str, epoch: int) -> dict:
         "gateway_request_id": request_id,
         "backend_instance": instance,
         "source": "gateway_binding",
+        "backend_instance_meaning": "gateway_registration",
         "host_inspection": False,
         "proves_answering_instance": False,
     }

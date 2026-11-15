@@ -307,6 +307,7 @@ class GatewayAdapterTests(unittest.TestCase):
         )
         self.assertFalse(report["routing_evidence"]["proves_answering_instance"])
         self.assertEqual(report["routing_evidence"]["source"], "gateway_binding")
+        self.assertEqual(report["routing_evidence"]["backend_instance_meaning"], "gateway_registration")
         self.assertEqual(report["routing_evidence"]["gateway_request_id"], "gwr_" + "ab" * 16)
         self.assertEqual(report["routing_evidence"]["backend_instance"], "bki_" + "cd" * 16)
         self.assertNotIn("hermes-a", json.dumps(report["routing_evidence"]))

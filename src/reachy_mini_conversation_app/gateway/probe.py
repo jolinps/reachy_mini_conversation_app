@@ -215,6 +215,7 @@ def _no_evidence(agent_id: str) -> dict:
         "gateway_request_id": "",
         "backend_instance": "",
         "source": "none",
+        "backend_instance_meaning": "gateway_registration",
         "host_inspection": False,
         "proves_answering_instance": False,
     }

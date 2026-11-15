@@ -1,0 +1,2517 @@
+diff --git a/src/device_gateway/app.py b/src/device_gateway/app.py
+index c3c9cf6..7a3851d 100644
+--- a/src/device_gateway/app.py
++++ b/src/device_gateway/app.py
+@@ -5,15 +5,16 @@ from __future__ import annotations
+ import asyncio
+ import json
+ import os
++import secrets
+ from pathlib import Path
+ 
+ from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+ 
+ from device_gateway.engine import TurnEngine
+ from device_gateway.server import build_engine_from_env, load_dotenv
+-from device_gateway.store import GatewayStore, StoreError
++from device_gateway.store import GatewayStore, StoreError, opaque_backend_instance
+ from reachy_hermes.hermes_api import HermesError
+-from reachy_hermes.protocol import validate_chat_request
++from reachy_hermes.protocol import event, validate_chat_request
+ from reachy_hermes.signing import verify_fields
+ 
+ 
+@@ -65,6 +66,8 @@ def create_app(
+             "tts": turn_engine.tts.health_detail(),
+             "tts_simulated": turn_engine.tts.simulated,
+             "registry_version": 2,
++            "chat_binding": 1,
++            "text_only": True,
+         }
+ 
+     @app.post("/v1/pairing/register")
+@@ -154,6 +157,15 @@ def create_app(
+         except StoreError as exc:
+             fail(exc)
+ 
++    @app.get("/v1/admin/devices/{device_id}/key")
++    def admin_key(device_id: str, request: Request):
++        """Public key only, so the hub can check a connector signature."""
++        require_admin(request)
++        row = database.device(device_id)
++        if row is None:
++            raise HTTPException(404, "This device is not registered.")
++        return {"device_id": device_id, "public_key": row["public_key"], "status": row["status"]}
++
+     @app.post("/v1/admin/devices/{device_id}/revoke")
+     async def admin_revoke(device_id: str, request: Request):
+         require_admin(request)
+@@ -213,26 +225,128 @@ def create_app(
+                 agent["session"] = "not_started"
+         return {"active_agent_id": device["active_agent_id"] or "", "agents": agents}
+ 
++    @app.post("/v1/scopes")
++    async def open_scope(request: Request):
++        device = _device_from_header(database, request)
++        _require_chat(device)
++        body = await _json(request)
++        try:
++            return database.open_scope(
++                device["device_id"],
++                str(body.get("user_ref", "")),
++                str(body.get("profile_ref", "")),
++            )
++        except StoreError as exc:
++            fail(exc)
++
++    @app.get("/v1/agents/{agent_id}/verification")
++    def agent_verification(agent_id: str, request: Request):
++        device = _device_from_header(database, request)
++        _require_chat(device)
++        if not database._granted_and_enabled(device["device_id"], agent_id):
++            raise HTTPException(403, "This device is not allowed to use that agent.")
++        try:
++            record = database.agent_runtime(agent_id)
++            health = turn_engine.backend_for_agent(record).health()
++            online = bool(getattr(health, "ok", False))
++        except Exception:
++            online = False
++        inspection = database.inspection(agent_id)
++        attested = inspection is not None
++        return {
++            "gateway_id": origin,
++            "agent_id": agent_id,
++            "granted": True,
++            "enabled": True,
++            "health": "online" if online else "offline",
++            "routing_verification": "verified" if attested else "unverified",
++            "verification_basis": "host_inspection" if attested else "none",
++            "configured_profile_is_not_proof": True,
++            "attested_profile": inspection["observed_profile"] if inspection else "",
++            "attested_instance": inspection["observed_instance"] if inspection else "",
++            "inspection_ref": inspection["inspection_ref"] if inspection else "",
++        }
++
++    @app.get("/v1/agents/{agent_id}/catalog")
++    def agent_catalog(agent_id: str, request: Request):
++        """Discovered Hermes profiles for one granted agent. No private endpoint or key."""
++        device = _device_from_header(database, request)
++        _require_chat(device)
++        if not database._granted_and_enabled(device["device_id"], agent_id):
++            raise HTTPException(403, "This device is not allowed to use that agent.")
++        try:
++            record = database.agent_runtime(agent_id)
++        except StoreError as exc:
++            fail(exc)
++        backend = turn_engine.backend_for_agent(record)
++        try:
++            online = bool(getattr(backend.health(), "ok", False))
++        except Exception:
++            online = False
++        discovered = _safe_catalog(getattr(backend, "discover_profiles", None))
++        return {
++            "agent_id": agent_id,
++            "instance_id": record.get("instance_id") or agent_id,
++            "framework": record.get("framework") or "",
++            "registry_profile_is_not_discovery": True,
++            "health": "online" if online else "offline",
++            "status": discovered["status"],
++            "error": discovered["error"],
++            "source": discovered["source"],
++            "fingerprint": discovered["fingerprint"],
++            "evidence": discovered.get("evidence") or "",
++            "profiles": discovered["profiles"],
++        }
++
++    @app.post("/v1/admin/agents/{agent_id}/inspection")
++    async def record_inspection(agent_id: str, request: Request):
++        require_admin(request)
++        body = await _json(request)
++        try:
++            database.record_inspection(
++                agent_id,
++                str(body.get("inspection_ref", "")),
++                str(body.get("observed_profile", "")),
++                str(body.get("observed_instance", "")),
++            )
++        except StoreError as exc:
++            fail(exc)
++        return {"status": "recorded", "agent_id": agent_id}
++
+     @app.post("/v1/agents/select")
+     async def select_agent(request: Request):
+         device = _device_from_header(database, request)
+         _require_chat(device)
+         body = await _json(request)
+         agent_id = str(body.get("agent_id", "")).strip()
++        scope_id = body.get("scope_id") or ""
++        if not isinstance(scope_id, str):
++            raise HTTPException(400, "scope_id is not valid.")
+         try:
+-            planned = database.prepare_switch(device["device_id"], agent_id)
++            planned = database.prepare_switch(device["device_id"], agent_id, scope_id)
+             record = database.agent_runtime(agent_id)
+         except StoreError as exc:
+             fail(exc)
++        backend_instance = opaque_backend_instance(record.get("backend_instance"))
++        if not backend_instance:
++            raise HTTPException(
++                502,
++                "The selected agent has no backend instance identifier. The previous agent is still selected.",
++            )
+         try:
+-            turn_engine.backend_for_agent(record).open_session(planned["conversation_id"])
++            opened = turn_engine.backend_for_agent(record).open_session(planned["conversation_id"])
+         except Exception:
+             raise HTTPException(
+                 502,
+                 "The agent did not open a session. The previous agent is still selected.",
+             ) from None
++        if opened != planned["conversation_id"]:
++            raise HTTPException(502, "The agent did not open the reserved session. The previous agent is still selected.")
+         try:
+-            committed = database.commit_switch(device["device_id"], agent_id, planned["epoch"])
++            committed = database.commit_switch(device["device_id"], agent_id, planned["epoch"], scope_id)
++            database.remember_hermes_session(
++                device["device_id"], agent_id, planned["conversation_id"], opened, scope_id
++            )
+         except StoreError as exc:
+             fail(exc)
+         turn_engine.cancel_running()
+@@ -241,6 +355,9 @@ def create_app(
+             "agent_id": committed["agent_id"],
+             "name": record["display_name"],
+             "framework": record["framework"],
++            "epoch": committed["epoch"],
++            "scope_id": scope_id,
++            "backend_instance": backend_instance,
+         }
+ 
+     @app.post("/v1/device/challenge")
+@@ -293,6 +410,16 @@ def create_app(
+         await _close_device(sockets, device_id)
+         return {"status": "revoked", "device_id": device_id}
+ 
++    @app.post("/v1/cancel")
++    async def cancel(request: Request):
++        _device_from_header(database, request)
++        body = await _json(request)
++        request_id = body.get("request_id")
++        if not isinstance(request_id, str) or not request_id:
++            raise HTTPException(400, "request_id is required")
++        turn_engine.cancel(request_id)
++        return {"status": "stopping", "request_id": request_id}
++
+     @app.post("/v1/chat")
+     async def chat(request: Request):
+         device = _device_from_header(database, request)
+@@ -340,6 +467,35 @@ def create_app(
+     return app
+ 
+ 
++def _stamp(item: dict, chat_request: dict) -> dict:
++    """Attach the destination frozen at bind time. Later selection changes do not rewrite it."""
++    stamped = dict(item)
++    for key in ("agent_id", "assignment_epoch", "gateway_request_id", "backend_instance"):
++        if key in chat_request:
++            stamped[key] = chat_request[key]
++    return stamped
++
++
++def _binding_event(chat_request: dict) -> dict | None:
++    if "gateway_request_id" not in chat_request:
++        return None
++    return event(
++        "binding",
++        request_id=chat_request["request_id"],
++        agent_id=chat_request["agent_id"],
++        assignment_epoch=chat_request["assignment_epoch"],
++        gateway_request_id=chat_request["gateway_request_id"],
++        backend_instance=chat_request["backend_instance"],
++    )
++
++
++def _cancelled_event(chat_request: dict, request_id: str) -> dict:
++    return _stamp(
++        {"type": "cancelled", "request_id": request_id or chat_request.get("request_id", "")},
++        chat_request,
++    )
++
++
+ def _constant(left: str, right: str) -> bool:
+     import hmac
+ 
+@@ -353,6 +509,51 @@ def _admin_token() -> str:
+     return os.environ.get("GATEWAY_ADMIN_TOKEN", "").strip()
+ 
+ 
++def _safe_catalog(method) -> dict:
++    empty = {"status": "unsupported", "error": "This destination does not list Hermes profiles.", "profiles": [], "source": "none", "fingerprint": "", "evidence": ""}
++    if method is None:
++        return empty
++    try:
++        payload = method()
++    except Exception:
++        return {"status": "failed", "error": "Profile discovery failed.", "profiles": [], "source": "backend", "fingerprint": "", "evidence": ""}
++    if not isinstance(payload, dict):
++        return {"status": "failed", "error": "Profile discovery failed.", "profiles": [], "source": "backend", "fingerprint": "", "evidence": ""}
++    status = payload.get("status") if payload.get("status") in {"fresh", "failed", "unsupported"} else "failed"
++    profiles = []
++    if status == "fresh":
++        for row in payload.get("profiles") or []:
++            if not isinstance(row, dict):
++                continue
++            name = row.get("backend_profile_id")
++            if not isinstance(name, str) or not name.strip():
++                continue
++            route = str(row.get("configured_route") or "")
++            identifier = name.strip()
++            if route and route != f"/p/{identifier}":
++                route = ""
++            profiles.append(
++                {
++                    "backend_profile_id": identifier,
++                    "display_name": str(row.get("display_name") or name).strip()[:120],
++                    "model": str(row.get("model") or "")[:120],
++                    "provider": str(row.get("provider") or "")[:120],
++                    "capabilities": [item for item in row.get("capabilities") or [] if isinstance(item, str)][:20],
++                    "enabled": row.get("enabled") is not False,
++                    "configured_route": route,
++                    "routing": "profile_prefix" if route else "",
++                }
++            )
++    return {
++        "status": status,
++        "error": str(payload.get("error") or "")[:300],
++        "profiles": profiles,
++        "source": str(payload.get("source") or "")[:40],
++        "fingerprint": str(payload.get("fingerprint") or "")[:80],
++        "evidence": str(payload.get("evidence") or "")[:300],
++    }
++
++
+ def _require_known_agent(agent: str) -> None:
+     file_name = os.environ.get("HERMES_AGENTS_FILE", "").strip()
+     if file_name:
+@@ -371,14 +572,30 @@ def _bind_turn(database: GatewayStore, engine: TurnEngine, device, body: dict):
+         chat_request = validate_chat_request(body)
+     except ValueError as exc:
+         raise HTTPException(400, str(exc)) from None
+-    try:
+-        route = database.active_route(device["device_id"])
+-    except StoreError as exc:
+-        raise HTTPException(exc.status, exc.args[0]) from None
+-    if route is None:
+-        chat_request["conversation_id"] = f"reachy-{device['device_id']}"
+-        return chat_request, None, None
+-    chat_request["conversation_id"] = route["conversation_id"]
++    chat_request["text_only"] = "1" if body.get("text_only") is True else ""
++    scope_id = body.get("scope_id") or ""
++    if not isinstance(scope_id, str):
++        raise HTTPException(400, "scope_id is not valid.")
++    expected_agent = body.get("expected_agent_id", None)
++    expected_epoch = body.get("expected_epoch", None)
++    if expected_agent is not None or expected_epoch is not None or scope_id:
++        if not isinstance(expected_agent, str) or not expected_agent.strip():
++            raise HTTPException(400, "expected_agent_id is required when binding a request.")
++        if isinstance(expected_epoch, bool) or not isinstance(expected_epoch, int):
++            raise HTTPException(400, "expected_epoch is required when binding a request.")
++        try:
++            route = database.bind_chat(device["device_id"], expected_agent.strip(), expected_epoch, scope_id)
++        except StoreError as exc:
++            raise HTTPException(exc.status, exc.args[0]) from None
++    else:
++        try:
++            route = database.active_route(device["device_id"])
++        except StoreError as exc:
++            raise HTTPException(exc.status, exc.args[0]) from None
++        if route is None:
++            chat_request["conversation_id"] = f"reachy-{device['device_id']}"
++            return chat_request, None, None
++    chat_request["conversation_id"] = route.get("hermes_session_id") or route["conversation_id"]
+     chat_request["agent_id"] = route["agent_id"]
+     try:
+         record = database.agent_runtime(route["agent_id"])
+@@ -387,6 +604,12 @@ def _bind_turn(database: GatewayStore, engine: TurnEngine, device, body: dict):
+         raise HTTPException(502, "The selected agent is not available.") from exc
+     epoch = route["epoch"]
+     device_id = device["device_id"]
++    backend_instance = opaque_backend_instance(record.get("backend_instance"))
++    if not backend_instance:
++        raise HTTPException(502, "The selected agent has no backend instance identifier.")
++    chat_request["assignment_epoch"] = epoch
++    chat_request["gateway_request_id"] = "gwr_" + secrets.token_hex(16)
++    chat_request["backend_instance"] = backend_instance
+ 
+     def still_current() -> bool:
+         return database.assignment_epoch(device_id) == epoch
+@@ -444,14 +667,10 @@ async def _close_device(sockets: dict[str, set[WebSocket]], device_id: str) -> N
+ async def _send_turn(websocket: WebSocket, engine: TurnEngine, chat_request: dict, backend=None, still_current=None) -> None:
+     loop = asyncio.get_running_loop()
+     queue: asyncio.Queue = asyncio.Queue()
+-    agent_id = chat_request.get("agent_id") or ""
+-
+     def emit(item: dict) -> None:
+         if still_current is not None and not still_current():
+             return
+-        if agent_id:
+-            item = {**item, "agent_id": agent_id}
+-        loop.call_soon_threadsafe(queue.put_nowait, item)
++        loop.call_soon_threadsafe(queue.put_nowait, _stamp(item, chat_request))
+ 
+     def runner() -> None:
+         try:
+@@ -459,13 +678,16 @@ async def _send_turn(websocket: WebSocket, engine: TurnEngine, chat_request: dic
+         finally:
+             loop.call_soon_threadsafe(queue.put_nowait, None)
+ 
++    opened = _binding_event(chat_request)
++    if opened is not None:
++        await websocket.send_json(opened)
+     task = asyncio.create_task(asyncio.to_thread(runner))
+     while True:
+         item = await queue.get()
+         if item is None:
+             break
+         if still_current is not None and not still_current():
+-            await websocket.send_json({"type": "cancelled", "request_id": item.get("request_id", "")})
++            await websocket.send_json(_cancelled_event(chat_request, item.get("request_id", "")))
+             while True:
+                 leftover = await queue.get()
+                 if leftover is None:
+@@ -480,14 +702,10 @@ async def _stream_turn(engine: TurnEngine, chat_request: dict, backend=None, sti
+ 
+     loop = asyncio.get_running_loop()
+     queue: asyncio.Queue = asyncio.Queue()
+-    agent_id = chat_request.get("agent_id") or ""
+-
+     def emit(item: dict) -> None:
+         if still_current is not None and not still_current():
+             return
+-        if agent_id:
+-            item = {**item, "agent_id": agent_id}
+-        loop.call_soon_threadsafe(queue.put_nowait, item)
++        loop.call_soon_threadsafe(queue.put_nowait, _stamp(item, chat_request))
+ 
+     def runner() -> None:
+         try:
+@@ -495,18 +713,20 @@ async def _stream_turn(engine: TurnEngine, chat_request: dict, backend=None, sti
+         finally:
+             loop.call_soon_threadsafe(queue.put_nowait, None)
+ 
++    opened = _binding_event(chat_request)
++    if opened is not None:
++        queue.put_nowait(opened)
+     asyncio.create_task(asyncio.to_thread(runner))
+ 
+     async def lines():
+         while True:
+             item = await queue.get()
+             if item is None:
++                if still_current is not None and not still_current():
++                    yield json.dumps(_cancelled_event(chat_request, chat_request["request_id"]), ensure_ascii=False) + "\n"
+                 break
+             if still_current is not None and not still_current():
+-                yield json.dumps(
+-                    {"type": "cancelled", "request_id": item.get("request_id", "")},
+-                    ensure_ascii=False,
+-                ) + "\n"
++                yield json.dumps(_cancelled_event(chat_request, item.get("request_id", "")), ensure_ascii=False) + "\n"
+                 while True:
+                     leftover = await queue.get()
+                     if leftover is None:
+diff --git a/src/device_gateway/engine.py b/src/device_gateway/engine.py
+index 2c6940d..42561ad 100644
+--- a/src/device_gateway/engine.py
++++ b/src/device_gateway/engine.py
+@@ -147,7 +147,13 @@ class TurnEngine:
+         if self._cancelled_now(request_id):
+             emit(event("cancelled", request_id=request_id))
+             return
++        # text is the whole reply. Hermes deltas are accumulated before this event.
+         emit(event("response_text", request_id=request_id, text=reply, final=True))
++        if str(request.get("text_only") or "") == "1":
++            with self._lock:
++                self._audio_done.add(request_id)
++            self._emit_if_current(emit, still_current, event("status", request_id=request_id, state="idle"))
++            return
+         emit(event("status", request_id=request_id, state="speaking"))
+         try:
+             speech = self.tts.synthesize(reply)
+diff --git a/src/device_gateway/store.py b/src/device_gateway/store.py
+index e9680e0..163118d 100644
+--- a/src/device_gateway/store.py
++++ b/src/device_gateway/store.py
+@@ -21,9 +21,12 @@ from device_gateway.pairing import verifier
+ from reachy_connector.pairing_code import normalize_code
+ 
+ 
+-SCHEMA_VERSION = 2
++SCHEMA_VERSION = 4
+ _AGENT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$")
++_OPAQUE_INSTANCE = re.compile(r"^bki_[a-f0-9]{32}$")
+ _CONVERSATION_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
++_SCOPE_ID = re.compile(r"^scp_[a-f0-9]{16}$")
++_REF = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,80}$")
+ 
+ 
+ class StoreError(ValueError):
+@@ -37,6 +40,7 @@ class GatewayStore:
+         self.path = path
+         path.parent.mkdir(parents=True, exist_ok=True)
+         self._backup_before_migration()
++        self._backup_schema_transition()
+         with self._connect() as conn:
+             conn.executescript(
+                 """
+@@ -363,11 +367,47 @@ class GatewayStore:
+         except OSError:
+             pass
+ 
++    def _backup_schema_transition(self) -> None:
++        """Copy a populated database once before this process raises its schema."""
++        if not self.path.is_file() or self.path.stat().st_size == 0:
++            return
++        backup = Path(str(self.path) + f".bak-before-{SCHEMA_VERSION}")
++        if backup.exists():
++            return
++        try:
++            with sqlite3.connect(self.path) as conn:
++                present = conn.execute(
++                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_version'"
++                ).fetchone()
++                if present is None:
++                    stored = 0
++                else:
++                    row = conn.execute("SELECT version FROM schema_version").fetchone()
++                    stored = int(row[0]) if row is not None else 0
++                devices = conn.execute(
++                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'devices'"
++                ).fetchone()
++                if devices is None:
++                    return
++                occupied = conn.execute("SELECT 1 FROM devices LIMIT 1").fetchone()
++        except sqlite3.Error:
++            return
++        if occupied is None or stored >= SCHEMA_VERSION:
++            return
++        shutil.copy2(self.path, backup)
++        try:
++            os.chmod(backup, 0o600)
++        except OSError:
++            pass
++
+     def _migrate(self, conn: sqlite3.Connection) -> None:
+         conn.execute("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)")
+         row = conn.execute("SELECT version FROM schema_version").fetchone()
+         if row is not None and int(row[0]) >= SCHEMA_VERSION:
++            _ensure_hermes_session_column(conn)
++            _ensure_application_scopes(conn)
+             _ensure_conversation_unique(conn)
++            _ensure_backend_instance(conn)
+             return
+         if not _has_column(conn, "devices", "active_agent_id"):
+             conn.execute("ALTER TABLE devices ADD COLUMN active_agent_id TEXT")
+@@ -427,11 +467,14 @@ class GatewayStore:
+                     """,
+                     (device["device_id"], agent_id, conversation_id, now),
+                 )
++        _ensure_hermes_session_column(conn)
++        _ensure_application_scopes(conn)
++        _ensure_conversation_unique(conn)
++        _ensure_backend_instance(conn)
+         if row is None:
+             conn.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
+         else:
+             conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
+-        _ensure_conversation_unique(conn)
+ 
+     def register_agent(
+         self,
+@@ -466,6 +509,7 @@ class GatewayStore:
+             raise StoreError("Instance ID is required.", 400)
+         granted = json.dumps([item for item in (capabilities or ["chat"]) if isinstance(item, str)][:12])
+         now = time.time()
++        backend_instance = new_backend_instance()
+         with self._connect() as conn:
+             conn.execute("BEGIN IMMEDIATE")
+             existing = conn.execute("SELECT agent_id FROM agents WHERE agent_id = ?", (agent_id,)).fetchone()
+@@ -476,8 +520,8 @@ class GatewayStore:
+                 """
+                 INSERT INTO agents (
+                     agent_id, framework, instance_id, profile, private_endpoint, routing,
+-                    display_name, server_name, capabilities, enabled, created_at
+-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
++                    display_name, server_name, capabilities, enabled, created_at, backend_instance
++                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 """,
+                 (
+                     agent_id,
+@@ -491,6 +535,7 @@ class GatewayStore:
+                     granted,
+                     1 if enabled else 0,
+                     now,
++                    backend_instance,
+                 ),
+             )
+             conn.execute(
+@@ -525,7 +570,7 @@ class GatewayStore:
+             return 0
+         return int(row["assignment_epoch"])
+ 
+-    def active_route(self, device_id: str) -> dict | None:
++    def active_route(self, device_id: str, scope_id: str = "") -> dict | None:
+         row = self.device(device_id)
+         if row is None or row["status"] != "paired":
+             return None
+@@ -534,40 +579,89 @@ class GatewayStore:
+             return None
+         if not self._granted_and_enabled(device_id, agent_id):
+             raise StoreError("This device is not allowed to use that agent.", 403)
++        conversation_id = self.conversation_id_for(device_id, agent_id, scope_id)
+         return {
+             "agent_id": agent_id,
+             "epoch": int(row["assignment_epoch"] or 0),
+-            "conversation_id": self.conversation_id_for(device_id, agent_id),
++            "conversation_id": conversation_id,
++            "hermes_session_id": self.hermes_session_id_for(device_id, agent_id, scope_id) or conversation_id,
++            "scope_id": scope_id,
+         }
+ 
+-    def conversation_id_for(self, device_id: str, agent_id: str) -> str:
++    def conversation_id_for(self, device_id: str, agent_id: str, scope_id: str = "") -> str:
+         with self._connect() as conn:
+             row = conn.execute(
+-                "SELECT conversation_id FROM conversations WHERE device_id = ? AND agent_id = ?",
+-                (device_id, agent_id),
++                """
++                SELECT conversation_id FROM conversations
++                WHERE device_id = ? AND agent_id = ? AND scope_id = ?
++                """,
++                (device_id, agent_id, scope_id or ""),
+             ).fetchone()
+         if row is not None:
+             return str(row["conversation_id"])
+-        return scoped_conversation_id(device_id, agent_id)
++        return scoped_conversation_id(device_id, agent_id, scope_id or "")
++
++    def hermes_session_id_for(self, device_id: str, agent_id: str, scope_id: str = "") -> str:
++        with self._connect() as conn:
++            if not _has_column(conn, "conversations", "hermes_session_id"):
++                return ""
++            row = conn.execute(
++                """
++                SELECT hermes_session_id FROM conversations
++                WHERE device_id = ? AND agent_id = ? AND scope_id = ?
++                """,
++                (device_id, agent_id, scope_id or ""),
++            ).fetchone()
++        if row is None or not row["hermes_session_id"]:
++            return ""
++        return str(row["hermes_session_id"])
++
++    def remember_hermes_session(
++        self,
++        device_id: str,
++        agent_id: str,
++        conversation_id: str,
++        hermes_session_id: str,
++        scope_id: str = "",
++    ) -> None:
++        """Record the backend session only when it is the session reserved for this pair."""
++        if hermes_session_id != conversation_id:
++            raise StoreError("The Hermes session does not match this conversation.", 502)
++        with self._connect() as conn:
++            conn.execute("BEGIN IMMEDIATE")
++            updated = conn.execute(
++                """
++                UPDATE conversations
++                SET hermes_session_id = ?
++                WHERE device_id = ? AND agent_id = ? AND scope_id = ? AND conversation_id = ?
++                """,
++                (hermes_session_id, device_id, agent_id, scope_id or "", conversation_id),
++            )
++            if updated.rowcount != 1:
++                conn.execute("ROLLBACK")
++                raise StoreError("The conversation for this agent was not reserved.", 409)
++            conn.execute("COMMIT")
+ 
+-    def prepare_switch(self, device_id: str, agent_id: str) -> dict:
++    def prepare_switch(self, device_id: str, agent_id: str, scope_id: str = "") -> dict:
+         if not self._granted_and_enabled(device_id, agent_id):
+             raise StoreError("This device is not allowed to use that agent.", 403)
+         row = self.device(device_id)
+         if row is None or row["status"] != "paired":
+             raise StoreError("This device is not paired.", 403)
+-        conversation_id = self._reserve_conversation(device_id, agent_id)
++        self._require_scope(device_id, scope_id)
++        conversation_id = self._reserve_conversation(device_id, agent_id, scope_id)
+         return {
+             "agent_id": agent_id,
+             "epoch": int(row["assignment_epoch"] or 0),
+             "conversation_id": conversation_id,
+             "previous_agent_id": row["active_agent_id"] or "",
++            "scope_id": scope_id or "",
+         }
+ 
+-    def commit_switch(self, device_id: str, agent_id: str, expected_epoch: int) -> dict:
++    def commit_switch(self, device_id: str, agent_id: str, expected_epoch: int, scope_id: str = "") -> dict:
+         if not self._granted_and_enabled(device_id, agent_id):
+             raise StoreError("This device is not allowed to use that agent.", 403)
+-        conversation_id = self.conversation_id_for(device_id, agent_id)
++        conversation_id = self.conversation_id_for(device_id, agent_id, scope_id)
+         with self._connect() as conn:
+             conn.execute("BEGIN IMMEDIATE")
+             updated = conn.execute(
+@@ -582,14 +676,183 @@ class GatewayStore:
+                 conn.execute("ROLLBACK")
+                 raise StoreError("The agent assignment changed. The previous agent is still selected.", 409)
+             conn.execute("COMMIT")
+-        return {"agent_id": agent_id, "epoch": expected_epoch + 1, "conversation_id": conversation_id}
++        return {
++            "agent_id": agent_id,
++            "epoch": expected_epoch + 1,
++            "conversation_id": conversation_id,
++            "scope_id": scope_id or "",
++        }
++
++    def open_scope(self, device_id: str, user_ref: str, profile_ref: str) -> dict:
++        """Mint a scope owned by this device. The client does not choose the Hermes id."""
++        if _REF.match(user_ref or "") is None or _REF.match(profile_ref or "") is None:
++            raise StoreError("The conversation scope reference is not valid.", 400)
++        row = self.device(device_id)
++        if row is None or row["status"] != "paired":
++            raise StoreError("This device is not paired.", 403)
++        with self._connect() as conn:
++            conn.execute("BEGIN IMMEDIATE")
++            existing = conn.execute(
++                """
++                SELECT scope_id, user_ref, profile_ref FROM application_scopes
++                WHERE device_id = ? AND user_ref = ? AND profile_ref = ?
++                """,
++                (device_id, user_ref, profile_ref),
++            ).fetchone()
++            if existing is not None:
++                conn.execute("COMMIT")
++                return {
++                    "scope_id": existing["scope_id"],
++                    "user_ref": existing["user_ref"],
++                    "profile_ref": existing["profile_ref"],
++                }
++            scope_id = "scp_" + secrets.token_hex(8)
++            conn.execute(
++                """
++                INSERT INTO application_scopes (scope_id, device_id, user_ref, profile_ref, created_at)
++                VALUES (?, ?, ?, ?, ?)
++                """,
++                (scope_id, device_id, user_ref, profile_ref, time.time()),
++            )
++            conn.execute("COMMIT")
++        return {"scope_id": scope_id, "user_ref": user_ref, "profile_ref": profile_ref}
++
++    def record_inspection(
++        self,
++        agent_id: str,
++        inspection_ref: str,
++        observed_profile: str,
++        observed_instance: str,
++    ) -> None:
++        """Store a host inspection separately from the registry profile label."""
++        if self.agent_runtime(agent_id).get("agent_id") != agent_id:
++            raise StoreError("That agent is not registered.", 404)
++        ref = " ".join(str(inspection_ref).split())
++        profile = str(observed_profile).strip()
++        instance = str(observed_instance).strip()
++        if not ref or len(ref) > 120 or not profile or len(profile) > 80 or not instance or len(instance) > 80:
++            raise StoreError("Inspection reference, profile, and instance are required.", 400)
++        with self._connect() as conn:
++            conn.execute(
++                """
++                INSERT INTO agent_inspections (
++                    agent_id, inspection_ref, observed_profile, observed_instance, recorded_at
++                ) VALUES (?, ?, ?, ?, ?)
++                ON CONFLICT(agent_id) DO UPDATE SET
++                    inspection_ref = excluded.inspection_ref,
++                    observed_profile = excluded.observed_profile,
++                    observed_instance = excluded.observed_instance,
++                    recorded_at = excluded.recorded_at
++                """,
++                (agent_id, ref, profile, instance, time.time()),
++            )
++
++    def inspection(self, agent_id: str) -> dict | None:
++        with self._connect() as conn:
++            row = conn.execute(
++                "SELECT * FROM agent_inspections WHERE agent_id = ?",
++                (agent_id,),
++            ).fetchone()
++        if row is None:
++            return None
++        return {key: row[key] for key in row.keys()}
++
++    def bind_chat(self, device_id: str, expected_agent_id: str, expected_epoch: int, scope_id: str = "") -> dict:
++        """Accept the request only when the device assignment still matches.
++
++        The check and the conversation lookup commit together. A mismatch
++        raises before the caller starts the Hermes request.
++        """
++        if _AGENT_ID.match(expected_agent_id) is None:
++            raise StoreError("Expected agent ID is not valid.", 400)
++        if isinstance(expected_epoch, bool) or not isinstance(expected_epoch, int) or expected_epoch < 0:
++            raise StoreError("Expected assignment epoch is not valid.", 400)
++        scope_id = scope_id or ""
++        if scope_id and _SCOPE_ID.match(scope_id) is None:
++            raise StoreError("Conversation scope is not valid.", 400)
++        with self._connect() as conn:
++            conn.execute("BEGIN IMMEDIATE")
++            device = conn.execute(
++                "SELECT status, active_agent_id, assignment_epoch FROM devices WHERE device_id = ?",
++                (device_id,),
++            ).fetchone()
++            if device is None or device["status"] != "paired":
++                conn.execute("ROLLBACK")
++                raise StoreError("This device is not paired.", 403)
++            active = device["active_agent_id"] or ""
++            epoch = int(device["assignment_epoch"] or 0)
++            if not active:
++                conn.execute("ROLLBACK")
++                raise StoreError("No agent is selected. The legacy route was not used.", 409)
++            if active != expected_agent_id or epoch != expected_epoch:
++                conn.execute("ROLLBACK")
++                raise StoreError("The selected agent changed before this request. It was not sent.", 409)
++            granted = conn.execute(
++                """
++                SELECT agents.enabled
++                FROM device_agents
++                JOIN agents ON agents.agent_id = device_agents.agent_id
++                WHERE device_agents.device_id = ? AND device_agents.agent_id = ?
++                """,
++                (device_id, expected_agent_id),
++            ).fetchone()
++            if granted is None or not granted["enabled"]:
++                conn.execute("ROLLBACK")
++                raise StoreError("This device is not allowed to use that agent.", 403)
++            if scope_id:
++                owned = conn.execute(
++                    "SELECT scope_id FROM application_scopes WHERE scope_id = ? AND device_id = ?",
++                    (scope_id, device_id),
++                ).fetchone()
++                if owned is None:
++                    conn.execute("ROLLBACK")
++                    raise StoreError("This device is not allowed to use that conversation scope.", 403)
++            row = conn.execute(
++                """
++                SELECT conversation_id, hermes_session_id FROM conversations
++                WHERE device_id = ? AND agent_id = ? AND scope_id = ?
++                """,
++                (device_id, expected_agent_id, scope_id),
++            ).fetchone()
++            if row is None:
++                conversation_id = scoped_conversation_id(device_id, expected_agent_id, scope_id)
++                if _CONVERSATION_ID.match(conversation_id) is None:
++                    conn.execute("ROLLBACK")
++                    raise StoreError("The conversation ID for this agent is not valid.", 500)
++                taken = conn.execute(
++                    "SELECT 1 FROM conversations WHERE conversation_id = ?",
++                    (conversation_id,),
++                ).fetchone()
++                if taken is not None:
++                    conn.execute("ROLLBACK")
++                    raise StoreError("That conversation ID is already used by another agent.", 409)
++                conn.execute(
++                    """
++                    INSERT INTO conversations (device_id, agent_id, scope_id, conversation_id, created_at)
++                    VALUES (?, ?, ?, ?, ?)
++                    """,
++                    (device_id, expected_agent_id, scope_id, conversation_id, time.time()),
++                )
++                hermes = ""
++            else:
++                conversation_id = str(row["conversation_id"])
++                hermes = str(row["hermes_session_id"] or "")
++            conn.execute("COMMIT")
++        return {
++            "agent_id": expected_agent_id,
++            "epoch": epoch,
++            "conversation_id": conversation_id,
++            "hermes_session_id": hermes or conversation_id,
++            "scope_id": scope_id,
++        }
+ 
+     def authorized_agents(self, device_id: str) -> list[dict]:
+         with self._connect() as conn:
+             rows = conn.execute(
+                 """
+                 SELECT agents.agent_id, agents.framework, agents.instance_id, agents.profile,
+-                       agents.display_name, agents.server_name, agents.capabilities, agents.enabled
++                       agents.display_name, agents.server_name, agents.capabilities, agents.enabled,
++                       agents.backend_instance
+                 FROM device_agents
+                 JOIN agents ON agents.agent_id = device_agents.agent_id
+                 WHERE device_agents.device_id = ?
+@@ -620,6 +883,8 @@ class GatewayStore:
+                     "capabilities": [item for item in capabilities if isinstance(item, str)],
+                     "enabled": bool(row["enabled"]),
+                     "active": row["agent_id"] == active,
++                    "backend_instance": opaque_backend_instance(row["backend_instance"]),
++                    "registry_labels_are_not_routing_evidence": True,
+                 }
+             )
+         return published
+@@ -652,40 +917,87 @@ class GatewayStore:
+             ).fetchone()
+         return row is not None and bool(row["enabled"])
+ 
+-    def _reserve_conversation(self, device_id: str, agent_id: str) -> str:
+-        conversation_id = self.conversation_id_for(device_id, agent_id)
++    def _require_scope(self, device_id: str, scope_id: str) -> None:
++        if not scope_id:
++            return
++        if _SCOPE_ID.match(scope_id) is None:
++            raise StoreError("Conversation scope is not valid.", 400)
++        with self._connect() as conn:
++            row = conn.execute(
++                "SELECT device_id FROM application_scopes WHERE scope_id = ?",
++                (scope_id,),
++            ).fetchone()
++        if row is None or row["device_id"] != device_id:
++            raise StoreError("This device is not allowed to use that conversation scope.", 403)
++
++    def _reserve_conversation(self, device_id: str, agent_id: str, scope_id: str = "") -> str:
++        scope_id = scope_id or ""
++        conversation_id = self.conversation_id_for(device_id, agent_id, scope_id)
+         if _CONVERSATION_ID.match(conversation_id) is None:
+             raise StoreError("The conversation ID for this agent is not valid.", 500)
+         with self._connect() as conn:
+             conn.execute("BEGIN IMMEDIATE")
+             taken = conn.execute(
+                 """
+-                SELECT device_id, agent_id FROM conversations
+-                WHERE conversation_id = ? AND NOT (device_id = ? AND agent_id = ?)
++                SELECT device_id, agent_id, scope_id FROM conversations
++                WHERE conversation_id = ? AND NOT (device_id = ? AND agent_id = ? AND scope_id = ?)
+                 """,
+-                (conversation_id, device_id, agent_id),
++                (conversation_id, device_id, agent_id, scope_id),
+             ).fetchone()
+             if taken is not None:
+                 conn.execute("ROLLBACK")
+                 raise StoreError("That conversation ID is already used by another agent.", 409)
+             conn.execute(
+                 """
+-                INSERT INTO conversations (device_id, agent_id, conversation_id, created_at)
+-                VALUES (?, ?, ?, ?)
+-                ON CONFLICT(device_id, agent_id) DO NOTHING
++                INSERT INTO conversations (device_id, agent_id, scope_id, conversation_id, created_at)
++                VALUES (?, ?, ?, ?, ?)
++                ON CONFLICT(device_id, agent_id, scope_id) DO NOTHING
+                 """,
+-                (device_id, agent_id, conversation_id, time.time()),
++                (device_id, agent_id, scope_id, conversation_id, time.time()),
+             )
+             stored = conn.execute(
+-                "SELECT conversation_id FROM conversations WHERE device_id = ? AND agent_id = ?",
+-                (device_id, agent_id),
++                """
++                SELECT conversation_id FROM conversations
++                WHERE device_id = ? AND agent_id = ? AND scope_id = ?
++                """,
++                (device_id, agent_id, scope_id),
+             ).fetchone()
+             conn.execute("COMMIT")
+         return str(stored["conversation_id"])
+ 
+ 
+-def scoped_conversation_id(device_id: str, agent_id: str) -> str:
+-    """One id per pair. A hash distinguishes pairs whose readable forms would match."""
++def new_backend_instance() -> str:
++    """Mint the id of one gateway backend registration.
++
++    A ``bki_`` value identifies the agent row stored by this gateway: its
++    configured listener, routing mode, and secret. It is not a container name,
++    a host name, or proof of which Hermes process answered. That proof is the
++    recorded host inspection compared with the resolved configuration.
++    """
++    return "bki_" + secrets.token_hex(16)
++
++
++def opaque_backend_instance(value) -> str:
++    if isinstance(value, str) and _OPAQUE_INSTANCE.match(value):
++        return value
++    return ""
++
++
++def scoped_conversation_id(device_id: str, agent_id: str, scope_id: str = "") -> str:
++    """One id per device, agent, and optional application scope.
++
++    An empty scope keeps the original device-agent id. A scope is part of the
++    hash, so two profiles do not share that Hermes session. Hermes global
++    memory is outside this id and is not isolated by it.
++    """
++    if scope_id:
++        raw = f"{device_id}\0{agent_id}\0{scope_id}"
++        digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
++        readable = re.sub(r"[^A-Za-z0-9_.:-]", "-", f"reachy-{device_id}--{agent_id}--{scope_id}")
++        candidate = f"{readable[:100].strip('-')}--{digest}"
++        if _CONVERSATION_ID.match(candidate) is None:
++            candidate = f"reachy-{digest}"
++        return candidate
+     raw = f"{device_id}\0{agent_id}"
+     digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
+     readable = re.sub(r"[^A-Za-z0-9_.:-]", "-", f"reachy-{device_id}--{agent_id}")
+@@ -695,6 +1007,90 @@ def scoped_conversation_id(device_id: str, agent_id: str) -> str:
+     return candidate
+ 
+ 
++def _ensure_backend_instance(conn: sqlite3.Connection) -> None:
++    exists = conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'agents'").fetchone()
++    if exists is None:
++        return
++    if not _has_column(conn, "agents", "backend_instance"):
++        conn.execute("ALTER TABLE agents ADD COLUMN backend_instance TEXT NOT NULL DEFAULT ''")
++    rows = conn.execute(
++        "SELECT agent_id FROM agents WHERE backend_instance IS NULL OR backend_instance = ''"
++    ).fetchall()
++    for row in rows:
++        conn.execute(
++            "UPDATE agents SET backend_instance = ? WHERE agent_id = ?",
++            (new_backend_instance(), row["agent_id"]),
++        )
++
++
++def _ensure_hermes_session_column(conn: sqlite3.Connection) -> None:
++    exists = conn.execute(
++        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'conversations'"
++    ).fetchone()
++    if exists is None or _has_column(conn, "conversations", "hermes_session_id"):
++        return
++    conn.execute("ALTER TABLE conversations ADD COLUMN hermes_session_id TEXT")
++
++
++def _ensure_application_scopes(conn: sqlite3.Connection) -> None:
++    conn.execute(
++        """
++        CREATE TABLE IF NOT EXISTS application_scopes (
++            scope_id TEXT PRIMARY KEY,
++            device_id TEXT NOT NULL,
++            user_ref TEXT NOT NULL,
++            profile_ref TEXT NOT NULL,
++            created_at REAL NOT NULL,
++            UNIQUE (device_id, user_ref, profile_ref)
++        )
++        """
++    )
++    conn.execute(
++        """
++        CREATE TABLE IF NOT EXISTS agent_inspections (
++            agent_id TEXT PRIMARY KEY,
++            inspection_ref TEXT NOT NULL,
++            observed_profile TEXT NOT NULL,
++            observed_instance TEXT NOT NULL,
++            recorded_at REAL NOT NULL
++        )
++        """
++    )
++    exists = conn.execute(
++        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'conversations'"
++    ).fetchone()
++    if exists is None or _has_column(conn, "conversations", "scope_id"):
++        return
++    conn.execute("DROP TABLE IF EXISTS conversations_v3")
++    conn.execute(
++        """
++        CREATE TABLE conversations_v3 (
++            device_id TEXT NOT NULL,
++            agent_id TEXT NOT NULL,
++            scope_id TEXT NOT NULL DEFAULT '',
++            conversation_id TEXT NOT NULL,
++            created_at REAL NOT NULL,
++            hermes_session_id TEXT,
++            PRIMARY KEY (device_id, agent_id, scope_id)
++        )
++        """
++    )
++    conn.execute(
++        """
++        INSERT INTO conversations_v3 (
++            device_id, agent_id, scope_id, conversation_id, created_at, hermes_session_id
++        )
++        SELECT device_id, agent_id, '', conversation_id, created_at, hermes_session_id
++        FROM conversations
++        """
++    )
++    conn.execute("DROP TABLE conversations")
++    conn.execute("ALTER TABLE conversations_v3 RENAME TO conversations")
++    conn.execute(
++        "CREATE UNIQUE INDEX IF NOT EXISTS conversations_conversation_id ON conversations(conversation_id)"
++    )
++
++
+ def _ensure_conversation_unique(conn: sqlite3.Connection) -> None:
+     exists = conn.execute(
+         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'conversations'"
+diff --git a/src/reachy_hermes/adapter.py b/src/reachy_hermes/adapter.py
+index 7f64dc0..7df7707 100644
+--- a/src/reachy_hermes/adapter.py
++++ b/src/reachy_hermes/adapter.py
+@@ -47,6 +47,9 @@ class HermesAdapter:
+     def health(self):
+         return self.client.health()
+ 
++    def discover_profiles(self) -> dict:
++        return self.client.discover_profiles()
++
+     def open_session(self, conversation_id: str) -> str:
+         return self.client.ensure_session(conversation_id)
+ 
+diff --git a/src/reachy_hermes/hermes_api.py b/src/reachy_hermes/hermes_api.py
+index b0b619a..ca88c8c 100644
+--- a/src/reachy_hermes/hermes_api.py
++++ b/src/reachy_hermes/hermes_api.py
+@@ -89,6 +89,11 @@ class InstalledHermes:
+             )
+         return HermesHealth("hermes", "API server capabilities responded.", True)
+ 
++    def discover_profiles(self) -> dict:
++        from reachy_hermes.profile_catalog import discover_installed
++
++        return discover_installed(self)
++
+     def ensure_session(self, session_id: str) -> str:
+         status, payload = self._request(
+             "POST",
+diff --git a/src/reachy_hermes/protocol.py b/src/reachy_hermes/protocol.py
+index 626f10f..df346a7 100644
+--- a/src/reachy_hermes/protocol.py
++++ b/src/reachy_hermes/protocol.py
+@@ -1,7 +1,9 @@
+ """Versioned messages between the robot connector and the device gateway.
+ 
+ A queued or accepted event is not completion. Completion is response_text
+-with final=true, followed by audio_end, or an error/cancelled event.
++with final=true. Speech clients then receive audio. A text_only request
++ends after that text and does not synthesize audio. error or cancelled
++ends the turn without an answer.
+ """
+ 
+ from __future__ import annotations
+@@ -22,6 +24,7 @@ EVENT_TYPES = frozenset(
+         "audio_end",
+         "error",
+         "cancelled",
++        "binding",
+         "heartbeat",
+     }
+ )
+diff --git a/src/reachy_hermes/profile_catalog.py b/src/reachy_hermes/profile_catalog.py
+new file mode 100644
+index 0000000..d4ab8c1
+--- /dev/null
++++ b/src/reachy_hermes/profile_catalog.py
+@@ -0,0 +1,153 @@
++"""Read Hermes profiles from an authoritative source.
++
++The order is the installed API list, then hermes_cli.profiles when that
++package is installed beside the gateway, then the profile name explicitly
++set in the gateway process environment. An empty environment does not
++become the name "default". Directory scans and model replies are not sources.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import os
++
++
++def discover_installed(client, environ=None) -> dict:
++    try:
++        status, payload = client._request("GET", "/api/profiles", None, acceptable=(404, 401, 403, 405))
++    except Exception:
++        return _failed("The Hermes profile list did not answer.", "api")
++    if status == 200 and isinstance(payload, dict) and isinstance(payload.get("profiles"), list):
++        return _ready(payload["profiles"], "api")
++    if status == 404 or status == 405:
++        official = _official_cli()
++        if official is not None:
++            return official
++        configured = configured_execution_context(environ)
++        if configured is not None:
++            return configured
++        return {
++            "status": "unsupported",
++            "error": (
++                "This Hermes API server does not list profiles, and hermes_cli.profiles "
++                "is not installed beside the gateway. HERMES_PROFILE is not set on this "
++                "process, so no profile, including default, was added."
++            ),
++            "profiles": [],
++            "source": "none",
++            "fingerprint": "",
++        }
++    if status in {401, 403}:
++        return _failed("The Hermes profile list rejected the gateway credential.", "api")
++    return _failed("The Hermes profile list was not a profile catalog.", "api")
++
++
++def configured_execution_context(environ=None) -> dict | None:
++    """Report the profile the gateway process was explicitly configured to call.
++
++    The gateway client appends ``/p/<HERMES_PROFILE>`` to HERMES_BASE_URL.
++    Both values have to be present. A missing name is not treated as default,
++    and a capabilities response is not a profile name.
++    """
++    env = os.environ if environ is None else environ
++    base = str(env.get("HERMES_BASE_URL", "")).strip()
++    profile = str(env.get("HERMES_PROFILE", "")).strip().strip("/")
++    if not base or not profile or "/" in profile or profile in {".", ".."}:
++        return None
++    found = _ready(
++        [{"name": profile, "display_name": profile, "enabled": True}],
++        "process_environment",
++    )
++    found["profiles"][0]["configured_route"] = f"/p/{profile}"
++    found["profiles"][0]["routing"] = "profile_prefix"
++    found["evidence"] = (
++        "HERMES_BASE_URL and HERMES_PROFILE are set on the gateway process. "
++        "This client routes that name as /p/<profile>. Additional named profiles "
++        "were not listed. This is not a host inspection and does not verify a reply."
++    )
++    return found
++
++
++def fingerprint(profiles: list[dict]) -> str:
++    body = [
++        {
++            "id": row["backend_profile_id"],
++            "name": row["display_name"],
++            "model": row["model"],
++            "provider": row["provider"],
++            "enabled": row["enabled"],
++        }
++        for row in profiles
++    ]
++    raw = json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
++    return hashlib.sha256(raw).hexdigest()
++
++
++def _ready(rows: list, source: str) -> dict:
++    profiles = []
++    seen = set()
++    for row in rows:
++        parsed = _one(row)
++        if parsed is None or parsed["backend_profile_id"] in seen:
++            continue
++        seen.add(parsed["backend_profile_id"])
++        profiles.append(parsed)
++    return {
++        "status": "fresh",
++        "error": "",
++        "profiles": profiles,
++        "source": source,
++        "fingerprint": fingerprint(profiles),
++    }
++
++
++def _one(row) -> dict | None:
++    if isinstance(row, dict):
++        data = row
++    else:
++        data = {
++            "name": getattr(row, "name", None),
++            "display_name": getattr(row, "display_name", None),
++            "model": getattr(row, "model", None),
++            "provider": getattr(row, "provider", None),
++            "enabled": getattr(row, "enabled", True),
++            "capabilities": getattr(row, "capabilities", None),
++            "description": getattr(row, "description", None),
++        }
++    identifier = data.get("name") or data.get("profile") or data.get("id") or ""
++    if not isinstance(identifier, str) or not identifier.strip() or "/" in identifier:
++        return None
++    capabilities = data.get("capabilities") if isinstance(data.get("capabilities"), list) else []
++    return {
++        "backend_profile_id": identifier.strip(),
++        "display_name": _text(data.get("display_name") or data.get("description") or identifier),
++        "model": _text(data.get("model") or data.get("model_name") or ""),
++        "provider": _text(data.get("provider") or ""),
++        "capabilities": [item for item in capabilities if isinstance(item, str)][:20],
++        "enabled": data.get("enabled") is not False,
++    }
++
++
++def _text(value) -> str:
++    if not isinstance(value, str):
++        return ""
++    return value.strip()[:120]
++
++
++def _failed(error: str, source: str) -> dict:
++    return {"status": "failed", "error": error, "profiles": [], "source": source, "fingerprint": ""}
++
++
++def _official_cli() -> dict | None:
++    try:
++        from hermes_cli.profiles import list_profiles
++    except ImportError:
++        return None
++    try:
++        rows = list_profiles()
++    except Exception:
++        return _failed("hermes_cli.profiles.list_profiles did not answer.", "hermes_cli")
++    if not isinstance(rows, list):
++        return _failed("hermes_cli.profiles.list_profiles did not return a list.", "hermes_cli")
++    return _ready(rows, "hermes_cli")
+diff --git a/tests/test_gateway_adapter.py b/tests/test_gateway_adapter.py
+new file mode 100644
+index 0000000..a0a2209
+--- /dev/null
++++ b/tests/test_gateway_adapter.py
+@@ -0,0 +1,840 @@
++"""Gateway binding and the hub's device-gateway adapter.
++
++The gateway under test is the local process. Nothing here deploys to the VPS
++or reuses a production robot identity.
++"""
++
++from __future__ import annotations
++
++import json
++import socket
++import threading
++import time
++import unittest
++import urllib.request
++from pathlib import Path
++from tempfile import TemporaryDirectory
++
++import psycopg
++import uvicorn
++from fastapi.testclient import TestClient
++
++from conversation_hub.app import create_app as create_hub
++from conversation_hub.gateway_backend import GatewayDestination, interpret_proof
++from conversation_hub.gateway_link import StreamingTransport
++from conversation_hub.ndjson import TurnParser
++from conversation_hub.store import HubStore
++from conversation_hub.turn import iter_turn
++from device_gateway.app import create_app
++from device_gateway.engine import TurnEngine
++from device_gateway.store import GatewayStore
++from reachy_hermes.hermes_api import FakeHermes, HermesError, HermesHealth
++from reachy_hermes.tts import FakeTTS
++
++DSN = "postgresql://jl@127.0.0.1:5432/reachy_hub_test"
++ADMIN = "hub-admin"
++PASSWORD = "hub-admin-pass"
++GATEWAY_KEY = "gateway-only-secret-key"
++
++
++class CountingHermes(FakeHermes):
++    def __init__(self):
++        self.calls = []
++
++    def chat(self, session_id, text, on_progress, should_cancel):
++        self.calls.append((session_id, text))
++        return super().chat(session_id, text, on_progress, should_cancel)
++
++
++class CountingTTS(FakeTTS):
++    def __init__(self):
++        self.calls = 0
++
++    def synthesize(self, text):
++        self.calls += 1
++        return super().synthesize(text)
++
++
++class Scripted:
++    def __init__(self, reply: str):
++        self.reply = reply
++        self.sessions = []
++        self.chats = []
++        self.entered = threading.Event()
++        self.release = threading.Event()
++        self.block = False
++
++    def health(self):
++        return HermesHealth("hermes", "stub destination", True)
++
++    def open_session(self, conversation_id: str) -> str:
++        self.sessions.append(conversation_id)
++        return conversation_id
++
++    def chat(self, conversation_id, text, on_progress, stopped):
++        self.chats.append((conversation_id, text))
++        if self.block:
++            self.entered.set()
++            while not self.release.is_set():
++                if stopped():
++                    raise HermesError("cancelled")
++                time.sleep(0.02)
++        if stopped():
++            raise HermesError("cancelled")
++        on_progress("lookup", "working")
++        return self.reply
++
++
++def free_port() -> int:
++    with socket.socket() as sock:
++        sock.bind(("127.0.0.1", 0))
++        return sock.getsockname()[1]
++
++
++def serve(app, port: int):
++    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error"))
++    thread = threading.Thread(target=server.run, daemon=True)
++    thread.start()
++    deadline = time.time() + 5
++    url = f"http://127.0.0.1:{port}"
++    while time.time() < deadline:
++        try:
++            with urllib.request.urlopen(url + "/health", timeout=0.2) as response:
++                if response.status == 200:
++                    return url, server, thread
++        except Exception:
++            time.sleep(0.05)
++    raise RuntimeError("test gateway did not start")
++
++
++def stop_server(server, thread) -> None:
++    server.should_exit = True
++    thread.join(5)
++
++
++class ParserTests(unittest.TestCase):
++    def test_final_snapshot_replaces_deltas_across_every_chunk_boundary(self):
++        payload = "\n".join(
++            [
++                json.dumps({"type": "status", "state": "thinking"}),
++                json.dumps({"type": "progress", "tool": "lookup", "preview": "working"}),
++                json.dumps({"type": "response_text", "text": "partial-", "final": False}),
++                json.dumps({"type": "response_text", "text": "COMPLETE", "final": True}),
++                json.dumps({"type": "audio_start", "encoding": "pcm_s16le"}),
++            ]
++        ) + "\n"
++        for size in range(1, len(payload) + 1):
++            parser = TurnParser()
++            for index in range(0, len(payload), size):
++                parser.feed(payload[index : index + size])
++            parser.finish()
++            self.assertEqual(parser.final_text, "COMPLETE")
++            self.assertEqual(parser.deltas, ["partial-"])
++            self.assertTrue(parser.saw_audio)
++            self.assertNotEqual(parser.final_text, "partial-COMPLETE")
++
++    def test_gateway_health_is_not_verification(self):
++        result = interpret_proof(
++            {"status": "ok", "hermes_mode": "hermes", "hermes_ok": True},
++            {"profile": "factory", "instance": "hermes-a"},
++        )
++        self.assertEqual(result["routing_verification"], "unverified")
++        self.assertIn("HTTP 200", result["verification_detail"])
++
++
++class GatewayContractTests(unittest.TestCase):
++    def setUp(self):
++        self.tmp = TemporaryDirectory()
++        self.legacy = CountingHermes()
++        self.tts = CountingTTS()
++        self.factory = Scripted("from-factory")
++        self.sales = Scripted("from-sales")
++        self.engine = TurnEngine(hermes=self.legacy, tts=self.tts)
++        self.engine.override_backend("factory", self.factory)
++        self.engine.override_backend("sales", self.sales)
++        self.store = GatewayStore(Path(self.tmp.name) / "gateway.db")
++        self.url = "http://127.0.0.1:8798"
++        self.app = create_app(self.store, self.engine, public_url=self.url, admin_token="admin-secret")
++        self.client = TestClient(self.app)
++        self.admin = {"Authorization": "Bearer admin-secret"}
++
++    def tearDown(self):
++        self.tmp.cleanup()
++
++    def test_binding_text_only_scopes_and_no_legacy_fallback(self):
++        health = self.client.get("/health").json()
++        self.assertEqual(health["chat_binding"], 1)
++        self.assertIs(health["text_only"], True)
++        self._register("factory")
++        self._register("sales")
++        device, token = self._pair()
++        self._grant(device, "factory")
++        self._grant(device, "sales")
++        headers = {"Authorization": f"Bearer {token}"}
++
++        unbound = self.client.post(
++            "/v1/chat",
++            headers=headers,
++            json={
++                "request_id": "req-legacy-1",
++                "conversation_id": "reachy-not-used",
++                "text": "should not echo",
++                "expected_agent_id": "factory",
++                "expected_epoch": 0,
++            },
++        )
++        self.assertEqual(unbound.status_code, 409, unbound.text)
++        self.assertIn("legacy", unbound.text.lower())
++        self.assertEqual(self.legacy.calls, [])
++        self.assertEqual(self.factory.chats, [])
++
++        listed = self.client.get("/v1/agents", headers=headers).json()
++        self.assertEqual({row["id"] for row in listed["agents"]}, {"factory", "sales"})
++        self.assertNotIn(GATEWAY_KEY, json.dumps(listed))
++        self.assertNotIn("127.0.0.1", json.dumps(listed))
++        for row in listed["agents"]:
++            self.assertRegex(row["backend_instance"], r"^bki_[a-f0-9]{32}$")
++            self.assertNotEqual(row["backend_instance"], row["instance_id"])
++            self.assertTrue(row["registry_labels_are_not_routing_evidence"])
++
++        proof = self.client.get("/v1/agents/factory/verification", headers=headers).json()
++        self.assertEqual(proof["health"], "online")
++        self.assertEqual(proof["routing_verification"], "unverified")
++        self.assertIs(proof["configured_profile_is_not_proof"], True)
++        self.assertNotIn("profile", proof)
++        self.assertNotIn(GATEWAY_KEY, json.dumps(proof))
++
++        first_scope = self.client.post(
++            "/v1/scopes",
++            headers=headers,
++            json={"user_ref": "user-a", "profile_ref": "family"},
++        ).json()["scope_id"]
++        second_scope = self.client.post(
++            "/v1/scopes",
++            headers=headers,
++            json={"user_ref": "user-a", "profile_ref": "bedtime"},
++        ).json()["scope_id"]
++        self.assertNotEqual(first_scope, second_scope)
++
++        family = self._select(headers, "factory", first_scope)
++        family_body = self._chat(headers, "factory", family["epoch"], first_scope, "hello family", "req-family-01")
++        bedtime = self._select(headers, "factory", second_scope)
++        self.assertNotEqual(family["conversation"], bedtime["conversation"])
++        self.assertEqual(len(self.factory.sessions), 2)
++
++        self.assertEqual(self._answer(family_body), "from-factory")
++        self.assertNotIn("audio_", family_body)
++        self.assertEqual(self.tts.calls, 0)
++        binding = next(item for item in self._events(family_body) if item["type"] == "binding")
++        final = next(item for item in self._events(family_body) if item["type"] == "response_text" and item.get("final") is True)
++        self.assertEqual(binding["agent_id"], "factory")
++        self.assertEqual(binding["assignment_epoch"], family["epoch"])
++        self.assertTrue(binding["gateway_request_id"].startswith("gwr_"))
++        self.assertNotEqual(binding["gateway_request_id"], "req-family-01")
++        self.assertRegex(binding["backend_instance"], r"^bki_[a-f0-9]{32}$")
++        self.assertEqual(final["gateway_request_id"], binding["gateway_request_id"])
++        self.assertEqual(final["backend_instance"], binding["backend_instance"])
++        self.assertEqual(final["assignment_epoch"], family["epoch"])
++        self.assertNotIn(GATEWAY_KEY, family_body)
++        self.assertNotIn("127.0.0.1", family_body)
++        self.assertNotIn("hermes-a", family_body)
++        self.assertNotIn("registry-label-not-proof", family_body)
++        self.assertEqual(self.factory.chats, [(family["conversation"], "hello family")])
++        self.assertEqual(self.sales.chats, [])
++        self.assertNotIn("reachy-not-used", self.factory.sessions)
++
++        spoken = self.client.post(
++            "/v1/chat",
++            headers=headers,
++            json={
++                "request_id": "req-spoken-1",
++                "conversation_id": "reachy-not-used",
++                "text": "speak",
++                "expected_agent_id": "factory",
++                "expected_epoch": bedtime["epoch"],
++                "scope_id": second_scope,
++            },
++        )
++        self.assertEqual(spoken.status_code, 200, spoken.text)
++        self.assertIn("audio_start", spoken.text)
++        self.assertEqual(self.tts.calls, 1)
++        self.assertEqual(self.factory.chats[1], (bedtime["conversation"], "speak"))
++
++        sales = self._select(headers, "sales", "")
++        sales_body = self._chat(headers, "sales", sales["epoch"], "", "hello sales", "req-sales-001")
++        self.assertEqual(self._answer(sales_body), "from-sales")
++        self.assertEqual(self.sales.chats[0][1], "hello sales")
++        self.assertNotEqual(self.sales.chats[0][0], self.factory.chats[0][0])
++
++        raced = self.client.post(
++            "/v1/chat",
++            headers=headers,
++            json={
++                "request_id": "req-raced-01",
++                "conversation_id": "reachy-not-used",
++                "text": "stale",
++                "expected_agent_id": "factory",
++                "expected_epoch": family["epoch"],
++                "text_only": True,
++            },
++        )
++        self.assertEqual(raced.status_code, 409, raced.text)
++        self.assertEqual([text for _session, text in self.factory.chats], ["hello family", "speak"])
++        self.assertEqual([text for _session, text in self.sales.chats], ["hello sales"])
++        self.assertEqual(self.legacy.calls, [])
++
++    def test_assignment_change_during_a_request_cancels_it(self):
++        port = free_port()
++        url = f"http://127.0.0.1:{port}"
++        self.factory.block = True
++        app = create_app(self.store, self.engine, public_url=url, admin_token="admin-secret")
++        _url, server, thread = serve(app, port)
++        try:
++            self._register("factory")
++            self._register("sales")
++            device, token = self._pair()
++            self._grant(device, "factory")
++            self._grant(device, "sales")
++            headers = {"Authorization": f"Bearer {token}"}
++            selected = self._select(headers, "factory", "")
++            holder = {}
++
++            def read_chat():
++                request = urllib.request.Request(
++                    url + "/v1/chat",
++                    data=json.dumps(
++                        {
++                            "request_id": "req-inflight1",
++                            "conversation_id": "reachy-not-used",
++                            "text": "in flight",
++                            "expected_agent_id": "factory",
++                            "expected_epoch": selected["epoch"],
++                            "text_only": True,
++                        }
++                    ).encode(),
++                    headers={**headers, "Content-Type": "application/json"},
++                    method="POST",
++                )
++                with urllib.request.urlopen(request, timeout=10) as response:
++                    holder["body"] = response.read().decode()
++
++            worker = threading.Thread(target=read_chat)
++            worker.start()
++            self.assertTrue(self.factory.entered.wait(3))
++            switched = self._select(headers, "sales", "")
++            self.assertEqual(switched["agent_id"], "sales")
++            self.factory.release.set()
++            worker.join(5)
++            self.assertFalse(worker.is_alive())
++            self.assertIn("cancelled", holder["body"])
++            self.assertNotIn("from-factory", holder["body"])
++            self.assertIn('"agent_id": "factory"', holder["body"])
++            self.assertNotIn('"agent_id": "sales"', holder["body"])
++            self.assertEqual(self.sales.chats, [])
++            self.assertEqual(self.legacy.calls, [])
++        finally:
++            self.factory.release.set()
++            stop_server(server, thread)
++
++    def test_unauthorized_destination_does_not_open_a_session(self):
++        self._register("factory")
++        self._register("sales")
++        device, token = self._pair()
++        self._grant(device, "factory")
++        headers = {"Authorization": f"Bearer {token}"}
++        rejected = self.client.post("/v1/agents/select", headers=headers, json={"agent_id": "sales"})
++        self.assertEqual(rejected.status_code, 403, rejected.text)
++        self.assertEqual(self.sales.sessions, [])
++        self.assertEqual(self.sales.chats, [])
++        self.assertEqual(self.factory.chats, [])
++        self.assertEqual(self.legacy.calls, [])
++
++    def test_cancel_discards_a_late_reply(self):
++        port = free_port()
++        url = f"http://127.0.0.1:{port}"
++        self.factory.block = True
++        app = create_app(self.store, self.engine, public_url=url, admin_token="admin-secret")
++        _url, server, thread = serve(app, port)
++        try:
++            self._register("factory")
++            device, token = self._pair()
++            self._grant(device, "factory")
++            headers = {"Authorization": f"Bearer {token}"}
++            selected = self._select(headers, "factory", "")
++            holder = {}
++
++            def read_chat():
++                request = urllib.request.Request(
++                    url + "/v1/chat",
++                    data=json.dumps(
++                        {
++                            "request_id": "req-cancel-01",
++                            "conversation_id": "reachy-not-used",
++                            "text": "in flight",
++                            "expected_agent_id": "factory",
++                            "expected_epoch": selected["epoch"],
++                            "text_only": True,
++                        }
++                    ).encode(),
++                    headers={**headers, "Content-Type": "application/json"},
++                    method="POST",
++                )
++                with urllib.request.urlopen(request, timeout=10) as response:
++                    holder["body"] = response.read().decode()
++
++            worker = threading.Thread(target=read_chat)
++            worker.start()
++            self.assertTrue(self.factory.entered.wait(3))
++            stopped = self.client.post("/v1/cancel", headers=headers, json={"request_id": "req-cancel-01"})
++            self.assertEqual(stopped.status_code, 200, stopped.text)
++            self.factory.release.set()
++            worker.join(5)
++            self.assertFalse(worker.is_alive())
++            self.assertIn("cancelled", holder["body"])
++            self.assertNotIn("from-factory", holder["body"])
++            self.assertNotIn("audio_", holder["body"])
++            self.assertEqual(self.tts.calls, 0)
++            cancelled = next(item for item in self._events(holder["body"]) if item["type"] == "cancelled")
++            self.assertEqual(cancelled["agent_id"], "factory")
++            self.assertEqual(cancelled["assignment_epoch"], selected["epoch"])
++            self.assertTrue(cancelled["gateway_request_id"].startswith("gwr_"))
++            self.assertRegex(cancelled["backend_instance"], r"^bki_[a-f0-9]{32}$")
++        finally:
++            self.factory.release.set()
++            stop_server(server, thread)
++
++    def test_missing_profile_catalog_does_not_block_a_verified_destination(self):
++        self._register("factory")
++        device, token = self._pair()
++        self._grant(device, "factory")
++        headers = {"Authorization": f"Bearer {token}"}
++        catalog = self.client.get("/v1/agents/factory/catalog", headers=headers)
++        self.assertEqual(catalog.status_code, 200, catalog.text)
++        payload = catalog.json()
++        self.assertEqual(payload["status"], "unsupported")
++        self.assertEqual(payload["profiles"], [])
++        self.assertNotIn("/p/default", catalog.text)
++        selected = self._select(headers, "factory", "")
++        body = self._chat(headers, "factory", selected["epoch"], "", "ping", "req-catalog-1")
++        self.assertEqual(self._answer(body), "from-factory")
++        self.assertNotIn("audio_", body)
++        self.assertEqual(self.tts.calls, 0)
++        self.assertEqual(self.factory.chats, [(selected["conversation"], "ping")])
++
++    def _register(self, agent_id: str) -> None:
++        response = self.client.post(
++            "/v1/admin/agents",
++            headers=self.admin,
++            json={
++                "agent_id": agent_id,
++                "framework": "hermes",
++                "instance_id": "hermes-a",
++                "profile": "registry-label-not-proof",
++                "private_endpoint": "http://127.0.0.1:9",
++                "api_key": GATEWAY_KEY,
++                "display_name": agent_id,
++            },
++        )
++        self.assertEqual(response.status_code, 200, response.text)
++
++    def _pair(self):
++        from conversation_hub.gateway_link import HubGateway, new_hub_identity
++
++        identity = new_hub_identity()
++        pairing = HubGateway(self.url, identity, _ClientTransport(self.client)).register()
++        claimed = self.client.post(
++            "/v1/admin/pair",
++            headers=self.admin,
++            json={
++                "device_id": identity.device_id,
++                "pairing_code": pairing["code"],
++                "agent": "reachy",
++                "device_name": "Hub development",
++                "capabilities": ["chat"],
++            },
++        )
++        self.assertEqual(claimed.status_code, 200, claimed.text)
++        token = HubGateway(self.url, identity, _ClientTransport(self.client)).authenticate()
++        return identity.device_id, token
++
++    def _grant(self, device_id: str, agent_id: str) -> None:
++        response = self.client.post(
++            f"/v1/admin/devices/{device_id}/agents",
++            headers=self.admin,
++            json={"agent_id": agent_id},
++        )
++        self.assertEqual(response.status_code, 200, response.text)
++
++    def _select(self, headers: dict, agent_id: str, scope_id: str) -> dict:
++        body = {"agent_id": agent_id}
++        if scope_id:
++            body["scope_id"] = scope_id
++        response = self.client.post("/v1/agents/select", headers=headers, json=body)
++        self.assertEqual(response.status_code, 200, response.text)
++        payload = response.json()
++        target = self.factory if agent_id == "factory" else self.sales
++        return {"epoch": payload["epoch"], "agent_id": payload["agent_id"], "conversation": target.sessions[-1]}
++
++    def _chat(self, headers, agent_id, epoch, scope_id, text, request_id) -> str:
++        body = {
++            "request_id": request_id,
++            "conversation_id": "reachy-not-used",
++            "text": text,
++            "expected_agent_id": agent_id,
++            "expected_epoch": epoch,
++            "text_only": True,
++        }
++        if scope_id:
++            body["scope_id"] = scope_id
++        response = self.client.post("/v1/chat", headers=headers, json=body)
++        self.assertEqual(response.status_code, 200, response.text)
++        return response.text
++
++    @staticmethod
++    def _events(body: str) -> list[dict]:
++        return [json.loads(line) for line in body.splitlines() if line.strip()]
++
++    @staticmethod
++    def _answer(body: str) -> str:
++        parser = TurnParser()
++        parser.feed(body if body.endswith("\n") else body + "\n")
++        parser.finish()
++        return parser.final_text or ""
++
++
++class _ClientTransport:
++    """Adapter transport over the in-process gateway client."""
++
++    def __init__(self, client: TestClient):
++        self.client = client
++
++    def __call__(self, method, url, body, headers):
++        path = url.split("://", 1)[-1]
++        path = path[path.find("/") :]
++        response = self.client.request(method, path, json=body, headers=headers)
++        try:
++            payload = response.json()
++        except Exception:
++            payload = {}
++        return response.status_code, payload if isinstance(payload, dict) else {}
++
++
++class HubAdapterTests(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        admin = psycopg.connect("postgresql://jl@127.0.0.1:5432/postgres", autocommit=True)
++        if admin.execute("SELECT 1 FROM pg_database WHERE datname = 'reachy_hub_test'").fetchone() is None:
++            admin.execute("CREATE DATABASE reachy_hub_test")
++        admin.close()
++
++    def setUp(self):
++        self.tmp = TemporaryDirectory()
++        self.hub_store = HubStore(DSN, ADMIN, PASSWORD, password_iterations=20_000)
++        self.hub_store.reset()
++        self.hub = TestClient(create_hub(self.hub_store))
++        self.login = self.hub.post("/api/login", json={"username": ADMIN, "password": PASSWORD})
++        self.assertEqual(self.login.status_code, 200, self.login.text)
++        self.legacy = CountingHermes()
++        self.tts = CountingTTS()
++        self.factory = Scripted("from-factory")
++        self.sales = Scripted("from-sales")
++        self.engine = TurnEngine(hermes=self.legacy, tts=self.tts)
++        self.engine.override_backend("factory", self.factory)
++        self.engine.override_backend("sales", self.sales)
++        self.gateway_store = GatewayStore(Path(self.tmp.name) / "gateway.db")
++        port = free_port()
++        self.url = f"http://127.0.0.1:{port}"
++        app = create_app(self.gateway_store, self.engine, public_url=self.url, admin_token="admin-secret")
++        self.url, self.server, self.thread = serve(app, port)
++        self.admin = {"Authorization": "Bearer admin-secret"}
++        GatewayDestination.before_chat = None
++        GatewayDestination.transport_factory = None
++
++    def tearDown(self):
++        GatewayDestination.before_chat = None
++        GatewayDestination.transport_factory = None
++        self.factory.release.set()
++        stop_server(self.server, self.thread)
++        self.tmp.cleanup()
++
++    def test_hub_uses_granted_agents_without_copying_secrets(self):
++        self._install_gateway()
++        created = self._reference("factory-ref", "factory", {"profile": "factory", "instance": "hermes-a"})
++        self._reference("sales-ref", "sales", {"profile": "sales", "instance": "hermes-b"})
++        public = json.dumps(self.hub.get("/api/agents").json())
++        diagnostics = json.dumps(self.hub.get("/api/diagnostics/agents").json())
++        gateways = json.dumps(self.hub.get("/api/gateways").json())
++        private_key = self.hub_store.gateway_private("live")["private_key_hex"]
++        for body in (public, diagnostics, gateways, json.dumps(created)):
++            self.assertNotIn(GATEWAY_KEY, body)
++            self.assertNotIn(private_key, body)
++            self.assertNotIn("http://127.0.0.1:9", body)
++        self.assertIn("live", public)
++        self.assertIn("factory", public)
++
++        unverified = self.hub.post("/api/agents/factory-ref/test")
++        self.assertEqual(unverified.status_code, 200, unverified.text)
++        self.assertFalse(unverified.json()["verified"])
++        self.assertIn("not proof", unverified.json()["verification_detail"])
++        self.assertNotIn(private_key, unverified.text)
++
++        self._inspect("factory", "host-read-factory", "factory", "hermes-a")
++        self._inspect("sales", "host-read-sales", "other-profile", "hermes-b")
++        mismatch = self.hub.post("/api/agents/sales-ref/test")
++        self.assertEqual(mismatch.json()["routing_verification"], "mismatch")
++        verified = self.hub.post("/api/agents/factory-ref/test")
++        self.assertTrue(verified.json()["verified"], verified.text)
++
++        self.hub_store.set_profile("family", "factory-ref", True)
++        self.hub_store.set_profile("bedtime", "factory-ref", True)
++        user = self.hub_store.user_for_token(self.login.cookies.get("hub_session"))
++        family = self.hub_store.open_conversation(user, self.hub_store.profile("family"))
++        bedtime = self.hub_store.open_conversation(user, self.hub_store.profile("bedtime"))
++        self.assertNotEqual(family["conversation_id"], bedtime["conversation_id"])
++
++        GatewayDestination.transport_factory = lambda: StreamingTransport(chunk_size=1)
++        family_events = list(
++            iter_turn(self.hub_store, user, family["conversation_id"], "hello family", "req-family-01", False)
++        )
++        bedtime_events = list(
++            iter_turn(self.hub_store, user, bedtime["conversation_id"], "hello bedtime", "req-bedtime1", False)
++        )
++        self.assertEqual(_final(family_events), "from-factory")
++        self.assertEqual(_final(bedtime_events), "from-factory")
++        self.assertEqual(self.tts.calls, 0)
++        self.assertEqual(len(set(self.factory.sessions)), 2)
++        self.assertNotIn("reachy-not-used", self.factory.sessions)
++        self.assertTrue(all(not session.endswith(user["user_id"]) for session in self.factory.sessions))
++        self.assertEqual(self.legacy.calls, [])
++        self.assertEqual([text for _session, text in self.factory.chats], ["hello family", "hello bedtime"])
++
++        sessions = self._session_count()
++        with self.hub_store.connect() as conn:
++            conn.execute("UPDATE gateways SET session_expires_at = now() - interval '1 minute'")
++            conn.commit()
++        self.hub_store.set_profile("teacher", "sales-ref", False)
++        self._inspect("sales", "host-read-sales", "sales", "hermes-b")
++        self.hub.post("/api/agents/sales-ref/test")
++        self.hub_store.set_profile("teacher", "sales-ref", True)
++        teacher = self.hub_store.open_conversation(user, self.hub_store.profile("teacher"))
++        sales_events = list(
++            iter_turn(self.hub_store, user, teacher["conversation_id"], "hello sales", "req-sales-001", False)
++        )
++        self.assertEqual(_final(sales_events), "from-sales")
++        self.assertGreater(self._session_count(), sessions)
++        self.assertEqual(self.sales.chats, [(self.sales.sessions[-1], "hello sales")])
++
++    def test_selection_race_and_inflight_switch_do_not_reroute(self):
++        self._install_gateway()
++        self._reference("factory-ref", "factory", {"profile": "factory", "instance": "hermes-a"})
++        self._reference("sales-ref", "sales", {"profile": "sales", "instance": "hermes-b"})
++        self._inspect("factory", "host-read-factory", "factory", "hermes-a")
++        self._inspect("sales", "host-read-sales", "sales", "hermes-b")
++        self.hub.post("/api/agents/factory-ref/test")
++        self.hub.post("/api/agents/sales-ref/test")
++        self.hub_store.set_profile("family", "factory-ref", True)
++        user = self.hub_store.user_for_token(self.login.cookies.get("hub_session"))
++        conversation = self.hub_store.open_conversation(user, self.hub_store.profile("family"))
++        token = self.hub_store.gateway_private("live")["session_token"]
++
++        def switch():
++            request = urllib.request.Request(
++                self.url + "/v1/agents/select",
++                data=json.dumps({"agent_id": "sales"}).encode(),
++                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
++                method="POST",
++            )
++            with urllib.request.urlopen(request, timeout=5) as response:
++                self.assertEqual(response.status, 200)
++
++        GatewayDestination.before_chat = switch
++        raced = list(iter_turn(self.hub_store, user, conversation["conversation_id"], "race", "req-race-0001", False))
++        self.assertTrue(any(event["type"] == "error" for event in raced))
++        self.assertNotIn("from-factory", json.dumps(raced))
++        self.assertNotIn("from-sales", json.dumps(raced))
++        self.assertEqual(self.factory.chats, [])
++        self.assertEqual(self.sales.chats, [])
++        self.assertEqual(self.legacy.calls, [])
++        GatewayDestination.before_chat = None
++
++        self.factory.block = True
++        holder = {}
++
++        def run():
++            holder["events"] = list(
++                iter_turn(self.hub_store, user, conversation["conversation_id"], "in flight", "req-inflight1", False)
++            )
++
++        worker = threading.Thread(target=run)
++        worker.start()
++        self.assertTrue(self.factory.entered.wait(3))
++        self.hub_store.cancel_request("req-inflight1", user["user_id"])
++        worker.join(5)
++        self.factory.release.set()
++        self.assertFalse(worker.is_alive())
++        self.assertTrue(any(event["type"] == "cancelled" for event in holder["events"]))
++        self.assertNotIn("from-factory", json.dumps(holder["events"]))
++        self.assertEqual(self.sales.chats, [])
++
++    def test_a_gateway_without_the_new_contract_is_not_used(self):
++        self._install_gateway()
++        self._reference("factory-ref", "factory", {"profile": "factory", "instance": "hermes-a"})
++        self._inspect("factory", "host-read-factory", "factory", "hermes-a")
++        self.hub.post("/api/agents/factory-ref/test")
++        stub = _Stub()
++        with self.hub_store.connect() as conn:
++            conn.execute("UPDATE gateways SET base_url = %s WHERE gateway_id = 'live'", (stub.url,))
++            conn.commit()
++        user = self.hub_store.user_for_token(self.login.cookies.get("hub_session"))
++        self.hub_store.set_profile("family", "factory-ref", True)
++        conversation = self.hub_store.open_conversation(user, self.hub_store.profile("family"))
++        events = list(iter_turn(self.hub_store, user, conversation["conversation_id"], "nope", "req-refused01", False))
++        self.assertTrue(any(event["type"] == "error" for event in events))
++        self.assertIn("not sent", json.dumps(events))
++        self.assertEqual(self.factory.chats, [])
++        self.assertEqual(self.legacy.calls, [])
++        self.assertEqual(stub.paths, ["/health"])
++
++    def test_secret_in_a_gateway_error_is_redacted(self):
++        self._install_gateway()
++        self._reference("factory-ref", "factory", {"profile": "factory", "instance": "hermes-a"})
++        private_key = self.hub_store.gateway_private("live")["private_key_hex"]
++        stub = _Stub(status=500, body={"detail": private_key})
++        with self.hub_store.connect() as conn:
++            conn.execute("UPDATE gateways SET base_url = %s WHERE gateway_id = 'live'", (stub.url,))
++            conn.commit()
++        probed = self.hub.post("/api/agents/factory-ref/test")
++        self.assertNotIn(private_key, probed.text)
++        self.assertIn("[redacted]", probed.text)
++        self.assertNotIn(private_key, json.dumps(self.hub.get("/api/diagnostics/agents").json()))
++
++    def _install_gateway(self) -> None:
++        self._register("factory")
++        self._register("sales")
++        created = self.hub.post(
++            "/api/gateways",
++            json={"gateway_id": "live", "display_name": "Local gateway", "base_url": self.url},
++        )
++        self.assertEqual(created.status_code, 200, created.text)
++        device_id = created.json()["device_id"]
++        self.assertTrue(device_id.startswith("hub_"))
++        claimed = urllib.request.Request(
++            self.url + "/v1/admin/pair",
++            data=json.dumps(
++                {
++                    "device_id": device_id,
++                    "pairing_code": created.json()["pairing"]["code"],
++                    "agent": "reachy",
++                    "device_name": "Hub development",
++                    "capabilities": ["chat"],
++                }
++            ).encode(),
++            headers={**self.admin, "Content-Type": "application/json"},
++            method="POST",
++        )
++        with urllib.request.urlopen(claimed, timeout=5) as response:
++            self.assertEqual(response.status, 200)
++        for agent_id in ("factory", "sales"):
++            grant = urllib.request.Request(
++                f"{self.url}/v1/admin/devices/{device_id}/agents",
++                data=json.dumps({"agent_id": agent_id}).encode(),
++                headers={**self.admin, "Content-Type": "application/json"},
++                method="POST",
++            )
++            with urllib.request.urlopen(grant, timeout=5) as response:
++                self.assertEqual(response.status, 200)
++        session = self.hub.post("/api/gateways/live/session")
++        self.assertEqual(session.status_code, 200, session.text)
++        self.assertTrue(session.json()["paired"])
++        self.assertEqual({row["id"] for row in session.json()["agents"]}, {"factory", "sales"})
++        self.assertNotIn("session_token", session.text)
++
++    def _register(self, agent_id: str) -> None:
++        request = urllib.request.Request(
++            self.url + "/v1/admin/agents",
++            data=json.dumps(
++                {
++                    "agent_id": agent_id,
++                    "framework": "hermes",
++                    "instance_id": "hermes-a" if agent_id == "factory" else "hermes-b",
++                    "profile": "registry-label-not-proof",
++                    "private_endpoint": "http://127.0.0.1:9",
++                    "api_key": GATEWAY_KEY,
++                    "display_name": agent_id,
++                }
++            ).encode(),
++            headers={**self.admin, "Content-Type": "application/json"},
++            method="POST",
++        )
++        with urllib.request.urlopen(request, timeout=5) as response:
++            self.assertEqual(response.status, 200)
++
++    def _reference(self, agent_id: str, remote: str, expected: dict) -> dict:
++        response = self.hub.post(
++            "/api/agents",
++            json={
++                "agent_id": agent_id,
++                "display_name": agent_id,
++                "backend_type": "device_gateway",
++                "gateway_id": "live",
++                "remote_agent_id": remote,
++                "expected_identity": expected,
++            },
++        )
++        self.assertEqual(response.status_code, 200, response.text)
++        return response.json()
++
++    def _inspect(self, agent_id: str, ref: str, profile: str, instance: str) -> None:
++        request = urllib.request.Request(
++            f"{self.url}/v1/admin/agents/{agent_id}/inspection",
++            data=json.dumps(
++                {"inspection_ref": ref, "observed_profile": profile, "observed_instance": instance}
++            ).encode(),
++            headers={**self.admin, "Content-Type": "application/json"},
++            method="POST",
++        )
++        with urllib.request.urlopen(request, timeout=5) as response:
++            self.assertEqual(response.status, 200)
++
++    def _session_count(self) -> int:
++        with self.gateway_store._connect() as conn:
++            return int(conn.execute("SELECT COUNT(*) AS n FROM sessions").fetchone()["n"])
++
++
++class _Stub:
++    def __init__(self, status: int = 200, body: dict | None = None):
++        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
++
++        parent = self
++
++        class Handler(BaseHTTPRequestHandler):
++            def log_message(self, fmt, *args):
++                return
++
++            def do_GET(self):  # noqa: N802
++                parent.paths.append(self.path)
++                payload = json.dumps(body or {"status": "ok"}).encode()
++                self.send_response(status)
++                self.send_header("Content-Type", "application/json")
++                self.send_header("Content-Length", str(len(payload)))
++                self.end_headers()
++                self.wfile.write(payload)
++
++            def do_POST(self):  # noqa: N802
++                parent.paths.append(self.path)
++                self.send_response(500)
++                self.end_headers()
++
++        self.paths = []
++        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
++        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
++        threading.Thread(target=self.server.serve_forever, daemon=True).start()
++
++
++def _final(events: list[dict]) -> str:
++    finals = [event.get("text") for event in events if event.get("type") == "response_text" and event.get("final") is True]
++    return finals[-1] if finals else ""
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_authorize_device.py b/tests/test_authorize_device.py
+new file mode 100644
+index 0000000..d34c81f
+--- /dev/null
++++ b/tests/test_authorize_device.py
+@@ -0,0 +1,96 @@
++"""Local checks for the device grant command. No request is sent."""
++
++import importlib.util
++import os
++import subprocess
++import sys
++import unittest
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[1]
++SCRIPT = ROOT / "deploy" / "authorize_device.py"
++
++
++def _load():
++    spec = importlib.util.spec_from_file_location("authorize_device", SCRIPT)
++    module = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(module)
++    return module
++
++
++class AuthorizeDeviceTests(unittest.TestCase):
++    def setUp(self):
++        self.module = _load()
++
++    def test_verified_profile_named_default_uses_the_listener_without_a_profile_path(self):
++        values = self._values("default", "private_endpoint", "http://10.1.2.3:8642", "http://10.1.2.3:8642")
++        self.assertEqual(values["observed_profile"], "default")
++        self.assertEqual(values["route_path"], "/")
++        self.assertNotIn("/p/default", values["private_endpoint"])
++
++    def test_missing_route_evidence_does_not_invent_a_profile_path(self):
++        with self.assertRaises(ValueError) as caught:
++            self._values("default", "profile_prefix", "http://10.1.2.3:8642", "")
++        self.assertIn("not inferred", str(caught.exception))
++        self.assertNotIn("/p/default", str(caught.exception))
++
++    def test_profile_prefix_requires_the_observed_path(self):
++        values = self._values(
++            "classroom",
++            "profile_prefix",
++            "http://10.1.2.3:8642",
++            "http://10.1.2.3:8642/p/classroom",
++        )
++        self.assertEqual(values["route_path"], "/p/classroom")
++        with self.assertRaises(ValueError):
++            self._values("default", "profile_prefix", "http://10.1.2.3:8642", "http://10.1.2.3:8642")
++
++    def test_a_path_is_not_accepted_as_the_profile_name(self):
++        with self.assertRaises(ValueError):
++            self._values("/p/default", "private_endpoint", "http://10.1.2.3:8642", "http://10.1.2.3:8642")
++
++    def test_dry_run_prints_no_listener_or_secret(self):
++        env = os.environ.copy()
++        env.update(self._env("default", "private_endpoint", "http://10.1.2.3:8642", "http://10.1.2.3:8642"))
++        completed = subprocess.run(
++            [sys.executable, str(SCRIPT)],
++            cwd=ROOT,
++            env=env,
++            text=True,
++            capture_output=True,
++            check=False,
++        )
++        self.assertEqual(completed.returncode, 0, completed.stderr)
++        self.assertIn("observed_profile: default", completed.stdout)
++        self.assertIn("observed_route_path: /", completed.stdout)
++        self.assertIn("profile path inferred: no", completed.stdout)
++        self.assertNotIn("10.1.2.3", completed.stdout)
++        self.assertNotIn("local-secret", completed.stdout)
++        self.assertNotIn("local-admin", completed.stdout)
++        self.assertIn("dry run: no request was sent", completed.stdout)
++
++    def _values(self, profile, routing, endpoint, evidence):
++        previous = os.environ.copy()
++        os.environ.update(self._env(profile, routing, endpoint, evidence))
++        try:
++            return self.module._values()
++        finally:
++            os.environ.clear()
++            os.environ.update(previous)
++
++    def _env(self, profile, routing, endpoint, evidence):
++        return {
++            "GATEWAY_ADMIN_TOKEN": "local-admin",
++            "HERMES_AGENT_ID": "inspected-agent",
++            "HERMES_ROUTING": routing,
++            "HERMES_PRIVATE_ENDPOINT": endpoint,
++            "HERMES_ROUTE_EVIDENCE": evidence,
++            "HERMES_API_KEY": "local-secret",
++            "OBSERVED_PROFILE": profile,
++            "OBSERVED_INSTANCE": "inspected-process",
++            "INSPECTION_REF": "host-note",
++        }
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/deploy/gateway-binding-rollout.md b/deploy/gateway-binding-rollout.md
+new file mode 100644
+index 0000000..75cccc6
+--- /dev/null
++++ b/deploy/gateway-binding-rollout.md
+@@ -0,0 +1,111 @@
++# Gateway binding rollout
++
++This patch is not deployed. It is the review package for the gateway that the conversation-app text probe will call after a separate, explicit deployment.
++
++The running voice baseline is not part of this change. Do not restart it to deploy the gateway.
++
++## What the patch changes
++
++Compared with commit `5ddc96e`, the gateway process:
++
++- Checks `expected_agent_id` and `expected_epoch` in one transaction before Hermes starts. A stale pair returns 409 and does not open another agent.
++- Freezes that agent, epoch, a server request id (`gwr_…`), and an opaque backend instance id (`bki_…`) for the turn. Selection changes and cancellation discard a late reply. The cancelled event still names the destination that was frozen, not the newly selected agent.
++- Skips TTS when `text_only` is true. `/health` advertises `chat_binding: 1` and `text_only: true` because those paths are implemented and covered by `tests/test_gateway_adapter.py`.
++- Mints `backend_instance` when an agent is registered. A `bki_…` value identifies that gateway registration row: the configured listener, routing mode, and server-side secret. It is not a container name, a host name, `instance_id`, or `server_name`. It does not by itself prove which Hermes process answered. That proof is a host inspection of the process and profile, compared with the listener and routing path that the registration resolved.
++- Reports profiles only from the Hermes API list, `hermes_cli.profiles`, or an explicit `HERMES_PROFILE` together with `HERMES_BASE_URL`. An empty catalog stays `unsupported` and does not block a chat to an agent that was registered and granted separately. A profile whose inspected name is `default` can be recorded. The path `/p/default` is never invented from that name.
++- Stores a host inspection separately from the registry label. `configured_profile_is_not_proof` stays true. A model reply is not inspection.
++
++`/health` and `hermes_ok` remain a process check. They are not routing evidence.
++
++## Files
++
++- `src/device_gateway/app.py`
++- `src/device_gateway/engine.py`
++- `src/device_gateway/store.py`
++- `src/reachy_hermes/protocol.py`
++- `src/reachy_hermes/adapter.py`
++- `src/reachy_hermes/hermes_api.py`
++- `src/reachy_hermes/profile_catalog.py`
++- `tests/test_gateway_adapter.py`
++- `deploy/authorize_device.py`
++
++`deploy/gateway-binding.patch` is a diff against local commit `5ddc96e`. The deployed gateway revision was not read, so this patch must not be applied until the files on the server are compared with that commit. If the server tree differs, regenerate the diff against the deployed tree. Do not apply the rest of the dirty working tree.
++
++## Configuration
++
++No new public port. The existing gateway origin stays `https://aiagent.jolinps.com`.
++
++These values stay on the server and are not written into the patch:
++
++- gateway admin token
++- Hermes API key
++- Hermes private listener URL
++- device private key
++
++The SQLite file gains schema version 4 and a nullable-default `backend_instance` column. Existing device rows, public keys, grants, and agent secrets stay in that file. On startup the new process copies a populated older database to `gateway.db.bak-before-4` once. Take a second copy before the restart. That copy is a migration backup, not the normal rollback.
++
++## Deployment, when it is approved
++
++1. On the gateway host, copy the live database to a timestamped file before replacing the process.
++2. Apply only this patch and restart the gateway process.
++3. Confirm `GET /health` includes `"chat_binding": 1` and `"text_only": true`.
++4. Do not register a new device and do not call pairing.
++
++## Rollback
++
++The normal rollback keeps the live database, so device identities, public keys, registry rows, and grants survive.
++
++1. Stop the new gateway process.
++2. Restore the previous program from the backup of the deployed tree. Do not replace `gateway.db` with the pre-deploy copy.
++3. Start the previous process against the same `GATEWAY_DB`. The added column has a default, so the previous program can keep reading the existing device and grant rows.
++4. Confirm the public health response no longer advertises `chat_binding` and `text_only`. The conversation-app probe will refuse to send a chat until those fields return.
++
++Restore the pre-deploy database copy only if the migration itself damages the file. That restore discards registry changes made after the copy. It is not the way to undo a bad program while keeping identities.
++
++## Device authorization
++
++Device `rch_A2VSW1KY88` is already registered. Authentication succeeded and returned no enabled agent. Do not create another identity and do not call `/v1/pairing/register` or `/v1/admin/pair`.
++
++The grant cannot be filled in yet. The deployed gateway revision, Hermes listener, routing path, profile, and instance were not readable from this machine. There is no active SSH session to the VPS. The earlier login was denied and was not retried. A health response, a container name, and a model self-description are not substitutes. Local notes that mention a listener port are not a new inspection.
++
++`OBSERVED_PROFILE=default` is accepted when that name was read from the host. `HERMES_ROUTE_EVIDENCE` must be the URL that was observed. For `private_endpoint`, that URL is the listener with no extra path. For `profile_prefix`, it must already be the observed profile path. The command does not create `/p/default` from the name `default`.
++
++After those values are known, run the dry run, then apply:
++
++```bash
++GATEWAY_ADMIN_TOKEN=… \
++HERMES_AGENT_ID=… \
++HERMES_ROUTING=private_endpoint \
++HERMES_PRIVATE_ENDPOINT=… \
++HERMES_ROUTE_EVIDENCE=… \
++HERMES_API_KEY=… \
++OBSERVED_PROFILE=… \
++OBSERVED_INSTANCE=… \
++INSPECTION_REF=… \
++python deploy/authorize_device.py
++
++GATEWAY_ADMIN_TOKEN=… \
++HERMES_AGENT_ID=… \
++HERMES_ROUTING=private_endpoint \
++HERMES_PRIVATE_ENDPOINT=… \
++HERMES_ROUTE_EVIDENCE=… \
++HERMES_API_KEY=… \
++OBSERVED_PROFILE=… \
++OBSERVED_INSTANCE=… \
++INSPECTION_REF=… \
++python deploy/authorize_device.py --apply
++```
++
++The dry run makes no network call. `--apply` checks that the device is already paired, registers one agent, grants it to `rch_A2VSW1KY88`, and records the inspection. It prints the agent id, the observed route path, and states that `bki_…` is the gateway registration id minted by the server. It does not print the API key, the listener address, or the admin token.
++
++## Acceptance after that authorization
++
++From the upgrade worktree, one text probe:
++
++```bash
++PYTHONPATH=src python -m reachy_mini_conversation_app.gateway.probe \
++  --identity /path/to/the-existing-identity.json \
++  --text "Reply with the single word pong."
++```
++
++A passing turn includes `gateway_request_id`, `backend_instance`, the selected agent id, and the assignment epoch, with `hermes_instance_proven` still false until the recorded inspection is compared with the host. The answer text is not that proof. Profile synchronization and voice integration stay out of this step.
+diff --git a/deploy/authorize_device.py b/deploy/authorize_device.py
+new file mode 100644
+index 0000000..1a1c043
+--- /dev/null
++++ b/deploy/authorize_device.py
+@@ -0,0 +1,182 @@
++"""Grant one already-paired device an inspected Hermes destination.
++
++The device id is fixed. This command never creates an identity and never calls
++pairing or /v1/admin/pair. Without --apply it prints the operation and does
++not open a network connection. Private values are read from the environment
++and are not printed.
++
++A profile whose inspected name is ``default`` is a real name. This command
++does not turn that name into ``/p/default``. The listener and the routing
++path have to be supplied from the host inspection.
++"""
++
++from __future__ import annotations
++
++import argparse
++import json
++import os
++import sys
++import urllib.error
++import urllib.request
++from urllib.parse import urlparse
++
++DEVICE_ID = "rch_A2VSW1KY88"
++GATEWAY = "https://aiagent.jolinps.com"
++PLACEHOLDERS = {"", "changeme", "change-me", "todo"}
++
++
++def main() -> int:
++    parser = argparse.ArgumentParser(description="Register and grant one inspected agent. Does not pair a device.")
++    parser.add_argument("--apply", action="store_true", help="Send the admin calls. The default is a dry run.")
++    args = parser.parse_args()
++    try:
++        values = _values()
++    except ValueError as exc:
++        print(f"authorization not prepared: {exc}", file=sys.stderr)
++        return 2
++    print("device_id:", DEVICE_ID)
++    print("gateway:", GATEWAY)
++    print("agent_id:", values["agent_id"])
++    print("observed_profile:", values["observed_profile"])
++    print("routing:", values["routing"])
++    print("observed_route_path:", values["route_path"])
++    print("observed_instance:", values["observed_instance"])
++    print("inspection_ref:", values["inspection_ref"])
++    print("listener and API key: present, not printed")
++    print("profile path inferred: no")
++    print("calls: GET /v1/admin/devices/{device_id}")
++    print("calls: POST /v1/admin/agents")
++    print("calls: POST /v1/admin/devices/{device_id}/agents")
++    print("calls: POST /v1/admin/agents/{agent_id}/inspection")
++    print("not called: /v1/pairing/register, /v1/admin/pair, /v1/device/forget")
++    if not args.apply:
++        print("dry run: no request was sent")
++        return 0
++    token = values.pop("admin_token")
++    try:
++        _apply(token, values)
++    except RuntimeError as exc:
++        print(f"authorization failed: {exc}", file=sys.stderr)
++        return 2
++    return 0
++
++
++def _values() -> dict:
++    required = {
++        "admin_token": "GATEWAY_ADMIN_TOKEN",
++        "agent_id": "HERMES_AGENT_ID",
++        "private_endpoint": "HERMES_PRIVATE_ENDPOINT",
++        "api_key": "HERMES_API_KEY",
++        "observed_profile": "OBSERVED_PROFILE",
++        "observed_instance": "OBSERVED_INSTANCE",
++        "inspection_ref": "INSPECTION_REF",
++        "routing": "HERMES_ROUTING",
++        "route_evidence": "HERMES_ROUTE_EVIDENCE",
++    }
++    values = {}
++    missing = []
++    for key, name in required.items():
++        value = os.environ.get(name, "").strip()
++        if value.lower() in PLACEHOLDERS or value == "/p/default":
++            missing.append(name)
++        else:
++            values[key] = value
++    if missing:
++        raise ValueError(
++            "Host inspection is still required. The listener and routing path were not inferred. Missing or placeholder: "
++            + ", ".join(missing)
++        )
++    if "/" in values["observed_profile"] or values["observed_profile"] in {".", ".."}:
++        raise ValueError("OBSERVED_PROFILE is not a single profile name. A path such as /p/default is not a profile name.")
++    if values["routing"] not in {"private_endpoint", "profile_prefix"}:
++        raise ValueError("HERMES_ROUTING must be private_endpoint or profile_prefix, chosen from the host inspection.")
++    if not values["private_endpoint"].startswith(("http://", "https://")):
++        raise ValueError("HERMES_PRIVATE_ENDPOINT must be the listener URL read on the host.")
++    if "aiagent.jolinps.com" in values["private_endpoint"]:
++        raise ValueError("HERMES_PRIVATE_ENDPOINT must be the Hermes listener, not the public gateway.")
++    endpoint, route_path = _require_observed_route(values["private_endpoint"], values["routing"], values["observed_profile"], values["route_evidence"])
++    values["private_endpoint"] = endpoint
++    values["route_path"] = route_path
++    return values
++
++
++def _apply(token: str, values: dict) -> None:
++    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
++    status = _request("GET", f"/v1/admin/devices/{DEVICE_ID}", None, headers)
++    if status.get("device_id") != DEVICE_ID or status.get("status") != "paired":
++        raise RuntimeError("This device is not already paired. Pairing was not started.")
++    created = _request(
++        "POST",
++        "/v1/admin/agents",
++        {
++            "agent_id": values["agent_id"],
++            "framework": "hermes",
++            "instance_id": values["observed_instance"],
++            "profile": values["observed_profile"],
++            "private_endpoint": values["private_endpoint"],
++            "api_key": values["api_key"],
++            "display_name": values["agent_id"],
++            "routing": values["routing"],
++        },
++        headers,
++    )
++    _request("POST", f"/v1/admin/devices/{DEVICE_ID}/agents", {"agent_id": values["agent_id"]}, headers)
++    _request(
++        "POST",
++        f"/v1/admin/agents/{values['agent_id']}/inspection",
++        {
++            "inspection_ref": values["inspection_ref"],
++            "observed_profile": values["observed_profile"],
++            "observed_instance": values["observed_instance"],
++        },
++        headers,
++    )
++    print("granted:", DEVICE_ID, created.get("agent_id", values["agent_id"]))
++    print("bki_ identifies the gateway registration row created for this grant.")
++    print("It was minted by the gateway and was not sent in this request.")
++    print("It does not by itself identify the Hermes process. That comes from the recorded inspection and the resolved listener.")
++
++
++def _require_observed_route(endpoint: str, routing: str, profile: str, evidence: str) -> tuple[str, str]:
++    """Check the supplied listener and path. Do not invent a profile path."""
++    listener = endpoint.rstrip("/")
++    observed = evidence.rstrip("/")
++    if not observed.startswith(("http://", "https://")):
++        raise ValueError("HERMES_ROUTE_EVIDENCE must be the URL observed for this route. No path was inferred.")
++    listener_parts = urlparse(listener)
++    observed_parts = urlparse(observed)
++    if listener_parts.scheme != observed_parts.scheme or listener_parts.netloc != observed_parts.netloc:
++        raise ValueError("The observed route is not on the configured listener. No other path was substituted.")
++    observed_path = observed_parts.path or "/"
++    if routing == "private_endpoint":
++        if observed_path not in {"", "/"}:
++            raise ValueError(
++                "private_endpoint routing was observed with an extra path. "
++                "That path was not rewritten, and /p/default was not inferred."
++            )
++        return listener, "/"
++    suffix = "/p/" + profile
++    if observed_path != suffix:
++        raise ValueError(
++            "profile_prefix routing does not match the observed path. "
++            "The path was not inferred from the profile name."
++        )
++    return listener, suffix
++
++
++def _request(method: str, path: str, body: dict | None, headers: dict) -> dict:
++    data = None if body is None else json.dumps(body).encode("utf-8")
++    request = urllib.request.Request(GATEWAY + path, data=data, headers=headers, method=method)
++    try:
++        with urllib.request.urlopen(request, timeout=20) as response:
++            payload = json.loads(response.read().decode("utf-8") or "{}")
++    except urllib.error.HTTPError as exc:
++        exc.read()
++        raise RuntimeError(f"{method} {path} was rejected ({exc.code}).") from None
++    if not isinstance(payload, dict):
++        raise RuntimeError(f"{method} {path} did not return JSON.")
++    return payload
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
