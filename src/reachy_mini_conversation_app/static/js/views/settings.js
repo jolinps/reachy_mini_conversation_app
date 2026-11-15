@@ -11,7 +11,19 @@ import {
   untilReady,
 } from "../api.js";
 import { SHOW_LATENCIES_KEY } from "../constants.js";
+import { buildProfileToolsSection } from "../components/profile-tools.js";
 import { h } from "../ui.js";
+import {
+  buildAgentSection,
+  buildConversationIntro,
+  buildDiagnosticsSection,
+  buildExperimentalVoice,
+  buildRobotSection,
+  buildSettingsNav,
+  buildToolsIntro,
+  loadSettingsSnapshot,
+  settingsSectionIds,
+} from "./settings-sections.js";
 
 const HF_CONNECTION_MODES = Object.freeze({
   DEPLOYED: "deployed",
@@ -26,7 +38,9 @@ const HF_MODE_HINTS = Object.freeze({
   [HF_CONNECTION_MODES.LOCAL]: "Connects directly to the host and port below.",
 });
 
-export async function mountSettingsView({ outlet, signal }) {
+export async function mountSettingsView({ outlet, signal, searchParams, replaceRoute }) {
+  const requested = searchParams?.get("section") || "robot";
+  const initial = settingsSectionIds().includes(requested) ? requested : "robot";
   const connectionSection = buildConnectionSection({
     onSaved: () =>
       Promise.all([
@@ -38,6 +52,28 @@ export async function mountSettingsView({ outlet, signal }) {
   const statusSection = buildStatusSection();
   const speechSection = buildSpeechSection();
   const developerSection = buildDeveloperSection();
+  const robotSection = buildRobotSection();
+  const agentSection = buildAgentSection();
+  const experimentalVoice = buildExperimentalVoice(connectionSection.element);
+  const profileTools = buildProfileToolsSection({ signal });
+  const toolsSection = buildToolsIntro(profileTools.element);
+  const diagnosticsSection = buildDiagnosticsSection(statusSection.element);
+  const panels = {
+    robot: robotSection.element,
+    agent: agentSection.element,
+    voice: experimentalVoice.element,
+    conversation: h("div", { class: "settings-stack" }, buildConversationIntro(), voiceSection.element, speechSection.element, developerSection),
+    tools: toolsSection,
+    diagnostics: diagnosticsSection.element,
+  };
+  const nav = buildSettingsNav(initial, (id) => show(id));
+
+  function show(id) {
+    const next = panels[id] ? id : "robot";
+    for (const [key, panel] of Object.entries(panels)) panel.hidden = key !== next;
+    nav.select(next);
+    replaceRoute?.(`#/settings?section=${next}`);
+  }
 
   const view = h(
     "section",
@@ -46,19 +82,25 @@ export async function mountSettingsView({ outlet, signal }) {
       "header",
       { class: "view-header" },
       h("h1", { class: "view-title" }, "Settings"),
-      h("p", { class: "view-subtitle" }, "Connection, voice, speech behavior, and runtime state for Reachy Mini.")
+      h("p", { class: "view-subtitle" }, "Robot, agent, voice, conversation, tools, and diagnostics.")
     ),
-    connectionSection.element,
-    voiceSection.element,
-    speechSection.element,
-    statusSection.element,
-    developerSection
+    nav.element,
+    ...Object.values(panels)
   );
   outlet.replaceChildren(view);
+  show(initial);
 
   await Promise.all([
     refreshStatus({ statusSection, connectionSection, speechSection, signal }),
     refreshVoices({ voiceSection, signal }),
+    loadSettingsSnapshot(signal).then((snapshot) => {
+      if (!snapshot || signal.aborted) return;
+      robotSection.sync(snapshot);
+      agentSection.sync(snapshot);
+      experimentalVoice.sync(snapshot);
+      diagnosticsSection.sync(snapshot);
+    }).catch(() => {}),
+    profileTools.refresh(),
   ]);
 }
 
@@ -216,7 +258,7 @@ function buildVoiceSection() {
   const element = h(
     "section",
     { class: "settings-section" },
-    h("h2", { class: "settings-section-title" }, "Voice"),
+    h("h2", { class: "settings-section-title" }, "Personality voice"),
     form
   );
 

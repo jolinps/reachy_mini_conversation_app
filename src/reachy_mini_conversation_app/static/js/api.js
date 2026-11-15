@@ -152,6 +152,14 @@ export const setLanguage = (language, scope) => rpcCall("language.set", { langua
 export const saveBackendConfig = (payload) => rpcCall("backend.config", payload);
 export const saveSpeechConfig = (payload) => rpcCall("speech.config", payload);
 
+export const getSettings = () => rpcCall("settings.get");
+export const saveSettings = (payload) => rpcCall("settings.save", payload);
+export const applySettings = () => rpcCall("settings.apply");
+export const testRobotConnection = () => rpcCall("settings.robot_test");
+export const refreshGatewayAgents = () => rpcCall("settings.agents", {}, { timeoutMs: 20000 });
+export const testGatewayText = (text) => rpcCall("settings.text_test", { text }, { timeoutMs: 30000 });
+export const exportDiagnostics = () => rpcCall("settings.diagnostics");
+
 export const listToolSpaces = () => rpcCall("tool_spaces.list");
 export const addToolSpace = (slug) =>
   rpcCall("tool_spaces.add", { slug }, { timeoutMs: TOOL_SPACE_TIMEOUT_MS });
@@ -173,6 +181,18 @@ const ERROR_MESSAGES = Object.freeze({
   invalid_hf_host: "That Hugging Face host doesn't look right.",
   invalid_hf_port: "That Hugging Face port doesn't look right.",
   invalid_hf_mode: "Unknown Hugging Face mode.",
+  invalid_settings: "That setting is not valid.",
+  unknown_setting: "That setting is not part of this console.",
+  secret_rejected: "Credentials stay out of the browser settings.",
+  invalid_robot_mode: "Choose the physical robot or the local simulator.",
+  invalid_robot_host: "Enter a host name or address without a login.",
+  invalid_robot_port: "Enter a port from 1 to 65535.",
+  invalid_gateway_url: "Enter an https gateway address.",
+  invalid_voice_route: "Choose the Hugging Face baseline or the Hermes voice route.",
+  apply_during_turn: "A turn is in progress. Apply the connection after it finishes.",
+  apply_during_playback: "Audio is still playing. Apply the connection after it finishes.",
+  apply_during_tool: "A tool is still running. Apply the connection after it finishes.",
+  settings_unavailable: "This app has no folder for saved settings.",
   missing_hf_session_url: "Couldn't reach the Hugging Face Space. Check it's running.",
   invalid_name: "Enter a valid profile name.",
   invalid_instructions: "Enter personality instructions.",

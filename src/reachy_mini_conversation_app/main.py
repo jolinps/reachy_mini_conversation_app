@@ -247,6 +247,7 @@ def run(
         startup_voice=startup_settings.voice,
         tool_deps=deps,
         camera_forced_off=args.no_camera,
+        start_muted=bool(getattr(args, "start_muted", False)),
     )
 
     # The page is served immediately, so the API must be live before the slow startup work below.

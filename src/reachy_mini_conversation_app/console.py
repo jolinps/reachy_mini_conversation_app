@@ -43,8 +43,10 @@ from reachy_mini_conversation_app.streaming import AdditionalOutputs, audio_to_f
 from reachy_mini_conversation_app.memory_routes import register_memory_methods
 from reachy_mini_conversation_app.profile_store import canonical_profile_name
 from reachy_mini_conversation_app.vision_routes import register_vision_methods
+from reachy_mini_conversation_app.settings_routes import register_settings_methods
 from reachy_mini_conversation_app.settings_store import (
     AppSettings,
+    read_settings,
     update_settings,
     apply_settings_to_runtime,
     load_settings_into_runtime,
@@ -125,6 +127,7 @@ class LocalStream:
         startup_voice: Optional[str] = None,
         tool_deps: ToolDependencies | None = None,
         camera_forced_off: bool = False,
+        start_muted: bool = False,
     ):
         """Initialize the stream with a realtime handler and pipelines.
 
@@ -147,7 +150,7 @@ class LocalStream:
         self._camera_forced_off = camera_forced_off
         self._settings_initialized = False
         self._asyncio_loop = None
-        self._mic_muted = False  # mic starts live; the UI toggles it via the settings API
+        self._mic_muted = bool(start_muted)
         self._audio_warming_up = False
         self._backend_connection_state = "not_started"
         self._backend_error: str | None = None
@@ -277,6 +280,108 @@ class LocalStream:
     def _can_rebuild_handler(self) -> bool:
         """Return whether LocalStream can construct handlers for backend changes."""
         return self._handler_factory is not None
+
+    def _settings_activity(self) -> dict[str, object]:
+        """Report turn, playback, and tool activity that must finish before Apply."""
+        now = time.monotonic()
+        handler = self.handler
+        playback = False
+        try:
+            playback = int(getattr(handler, "playback_pending_frames", 0) or 0) > 0 or float(
+                getattr(handler, "playback_until", 0) or 0
+            ) > now or self._playback_clock > now
+        except (TypeError, ValueError):
+            playback = False
+        tools = False
+        getter = getattr(getattr(handler, "tool_manager", None), "get_running_tools", None)
+        if callable(getter):
+            try:
+                tools = bool(getter())
+            except Exception:
+                tools = False
+        return {
+            "turn": self._last_turn_state,
+            "playback": playback,
+            "tool_execution": tools,
+        }
+
+    def _refuse_disruptive_change(self) -> None:
+        """Block a live reconnect while a turn, playback, or tool is still active."""
+        from reachy_mini_conversation_app.settings_sections import _busy_reason
+
+        reason = _busy_reason(self._settings_activity())
+        if reason is None:
+            return
+        raise JsonRpcError(
+            "The conversation is busy. Apply this change after it finishes.",
+            reason=reason,
+            code=-32602,
+        )
+
+    def _runtime_settings_status(self) -> dict[str, object]:
+        """Classify saved Hugging Face and speech settings against the live config."""
+        saved = read_settings(self._instance_path)
+        return self._classify_runtime_settings(saved)
+
+    def _apply_supported_runtime_settings(self, saved: AppSettings) -> dict[str, object]:
+        """Reconnect only Hugging Face and speech settings the official runtime owns."""
+        speech: dict[str, bool] = {}
+        if isinstance(saved.local_vad_enabled, bool) and saved.local_vad_enabled != config.LOCAL_VAD_ENABLED:
+            speech["local_vad_enabled"] = saved.local_vad_enabled
+        if (
+            isinstance(saved.local_barge_in_enabled, bool)
+            and saved.local_barge_in_enabled != config.LOCAL_BARGE_IN_ENABLED
+        ):
+            speech["local_barge_in_enabled"] = saved.local_barge_in_enabled
+        if speech:
+            self._apply_setting_with_restart(AppSettings(**speech), "speech_settings_changed")
+
+        selection = get_hf_connection_selection()
+        if saved.hf_connection_mode == HF_LOCAL_CONNECTION_MODE and saved.hf_ws_url:
+            same_target = (
+                selection.mode == HF_LOCAL_CONNECTION_MODE and selection.direct_ws_url == saved.hf_ws_url
+            )
+            if not same_target:
+                host, port = parse_hf_direct_target(saved.hf_ws_url)
+                if host and port:
+                    self._persist_hf_direct_connection(host, port)
+                    if self._can_rebuild_handler():
+                        self._mark_restart_requested("backend_config_changed")
+        elif saved.hf_connection_mode == HF_DEPLOYED_CONNECTION_MODE and selection.mode != HF_DEPLOYED_CONNECTION_MODE:
+            self._persist_hf_allocator_connection()
+            if self._can_rebuild_handler():
+                self._mark_restart_requested("backend_config_changed")
+        return self._classify_runtime_settings(read_settings(self._instance_path))
+
+    def _classify_runtime_settings(self, saved: AppSettings) -> dict[str, object]:
+        pending: list[str] = []
+        applied: list[str] = []
+        restarting = self._restart_requested.is_set() or self._backend_connection_state == "connecting"
+        speech_pairs = (
+            ("local_vad_enabled", saved.local_vad_enabled, config.LOCAL_VAD_ENABLED),
+            ("local_barge_in_enabled", saved.local_barge_in_enabled, config.LOCAL_BARGE_IN_ENABLED),
+        )
+        for name, wanted, current in speech_pairs:
+            if not isinstance(wanted, bool):
+                continue
+            if wanted == current and self._backend_connected() and not restarting:
+                applied.append(name)
+            else:
+                pending.append(name)
+        selection = get_hf_connection_selection()
+        if saved.hf_connection_mode == HF_LOCAL_CONNECTION_MODE and saved.hf_ws_url:
+            matches = selection.mode == HF_LOCAL_CONNECTION_MODE and selection.direct_ws_url == saved.hf_ws_url
+            if matches and self._backend_connected() and not restarting:
+                applied.append("hf_connection_mode")
+            else:
+                pending.append("hf_connection_mode")
+        elif saved.hf_connection_mode == HF_DEPLOYED_CONNECTION_MODE:
+            if selection.mode == HF_DEPLOYED_CONNECTION_MODE and self._backend_connected() and not restarting:
+                applied.append("hf_connection_mode")
+            else:
+                pending.append("hf_connection_mode")
+        state = "pending_restart" if pending else ("applied" if applied else "unchanged")
+        return {"state": state, "applied_fields": applied, "pending_restart": pending}
 
     def _build_handler_for_current_backend(self) -> ConversationHandler:
         """Create and install a fresh handler for the current runtime backend config."""
@@ -624,6 +729,7 @@ class LocalStream:
 
         @rpc.method("backend.config")  # type: ignore[untyped-decorator]
         def _rpc_backend_config(params: dict[str, object]) -> dict[str, object]:
+            self._refuse_disruptive_change()
             hf_selection = get_hf_connection_selection()
             hf_mode = str(params.get("hf_mode") or hf_selection.mode).strip().lower()
             if hf_mode == HF_LOCAL_CONNECTION_MODE:
@@ -655,6 +761,7 @@ class LocalStream:
             return {"ok": True, "message": message, **_status_payload()}
 
         def _rpc_speech_config(params: dict[str, object]) -> dict[str, object]:
+            self._refuse_disruptive_change()
             names = ("local_vad_enabled", "local_barge_in_enabled")
             for name in names:
                 if name in params and not isinstance(params[name], bool):
@@ -680,6 +787,17 @@ class LocalStream:
             }
 
         rpc.register("speech.config", _rpc_speech_config)
+        try:
+            register_settings_methods(
+                rpc,
+                self._instance_path,
+                turn_state=lambda: self._last_turn_state,
+                activity=self._settings_activity,
+                runtime_apply=self._apply_supported_runtime_settings,
+                runtime_status=self._runtime_settings_status,
+            )
+        except Exception:
+            logger.exception("Failed to register settings sections")
         rpc.mount(settings_app)
         self._rpc = rpc
 

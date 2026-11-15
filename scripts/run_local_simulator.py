@@ -7,10 +7,18 @@ it through run(..., robot=...), leaving the application itself unchanged.
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
 import gstreamer_libs
 
 gstreamer_libs.setup_python_environment()
 
+ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+sys.path.insert(0, str(SRC))
+
+import reachy_mini_conversation_app
 from reachy_mini import ReachyMini
 from reachy_mini.media.media_manager import MediaBackend
 from reachy_mini_conversation_app.main import run
@@ -19,13 +27,21 @@ from reachy_mini_conversation_app.utils import parse_args
 SIM_HOST = "127.0.0.1"
 SIM_PORT = 8010
 SIM_NAME = "reachy-mini-sim"
+INSTANCE_PATH = Path.home() / "Library/Application Support/Reachy/conversation-app"
 
 
 def main() -> None:
     """Connect to the verified simulator, then run the official application."""
+    loaded = Path(reachy_mini_conversation_app.__file__).resolve()
+    if SRC not in loaded.parents:
+        raise SystemExit(f"Refusing to start: loaded {loaded}, expected {SRC}")
+    print(f"Loaded conversation app from {loaded}", flush=True)
+
     args, _unknown = parse_args()
     args.ui = True
     args.no_camera = True
+    args.start_muted = True
+    INSTANCE_PATH.mkdir(parents=True, exist_ok=True)
 
     robot = ReachyMini(
         robot_name=SIM_NAME,
@@ -62,7 +78,7 @@ def main() -> None:
         f"no_media={status.no_media} media={robot.media.backend.name}",
         flush=True,
     )
-    run(args, robot=robot, instance_path="/tmp/reachy-conversation-instance")
+    run(args, robot=robot, instance_path=str(INSTANCE_PATH))
 
 
 if __name__ == "__main__":

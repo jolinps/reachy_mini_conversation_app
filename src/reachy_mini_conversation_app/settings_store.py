@@ -26,6 +26,7 @@ from reachy_mini_conversation_app.config import (
 logger = logging.getLogger(__name__)
 
 SETTINGS_FILENAME = "settings.json"
+APPLIED_FILENAME = "settings-applied.json"
 SETTINGS_VERSION = 1
 
 _STORE_LOCK = threading.Lock()
@@ -43,11 +44,25 @@ class AppSettings:
     camera_enabled: bool | None = None
     local_vad_enabled: bool | None = None
     local_barge_in_enabled: bool | None = None
+    robot_mode: str | None = None
+    robot_host: str | None = None
+    robot_port: int | None = None
+    robot_name: str | None = None
+    robot_advanced_host: str | None = None
+    gateway_url: str | None = None
+    gateway_agent_id: str | None = None
+    device_identity_path: str | None = None
+    voice_route: str | None = None
+    stt_provider: str | None = None
+    tts_provider: str | None = None
+    stt_language: str | None = None
+    tts_voice: str | None = None
+    voice_runtime_url: str | None = None
 
 
-def _settings_path(instance_path: str | Path | None) -> Path | None:
-    """Return the settings file for an instance directory, if there is one."""
-    return None if instance_path is None else Path(instance_path) / SETTINGS_FILENAME
+def _settings_path(instance_path: str | Path | None, filename: str = SETTINGS_FILENAME) -> Path | None:
+    """Return one settings file for an instance directory, if there is one."""
+    return None if instance_path is None else Path(instance_path) / filename
 
 
 def _text(payload: dict[str, Any], name: str) -> str | None:
@@ -62,6 +77,16 @@ def _flag(payload: dict[str, Any], name: str) -> bool | None:
     """Return a stored boolean, or None when absent or unusable."""
     value = payload.get(name)
     return value if isinstance(value, bool) else None
+
+
+def _port(payload: dict[str, Any], name: str) -> int | None:
+    """Return a stored port, or None when absent or unusable."""
+    value = payload.get(name)
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    if value < 1 or value > 65535:
+        return None
+    return value
 
 
 def _profile_languages(payload: dict[str, Any], path: Path) -> dict[str, str] | None:
@@ -103,18 +128,36 @@ def _read_unlocked(path: Path | None) -> AppSettings:
         camera_enabled=_flag(payload, "camera_enabled"),
         local_vad_enabled=_flag(payload, "local_vad_enabled"),
         local_barge_in_enabled=_flag(payload, "local_barge_in_enabled"),
+        robot_mode=_text(payload, "robot_mode"),
+        robot_host=_text(payload, "robot_host"),
+        robot_port=_port(payload, "robot_port"),
+        robot_name=_text(payload, "robot_name"),
+        robot_advanced_host=_text(payload, "robot_advanced_host"),
+        gateway_url=_text(payload, "gateway_url"),
+        gateway_agent_id=_text(payload, "gateway_agent_id"),
+        device_identity_path=_text(payload, "device_identity_path"),
+        voice_route=_text(payload, "voice_route"),
+        stt_provider=_text(payload, "stt_provider"),
+        tts_provider=_text(payload, "tts_provider"),
+        stt_language=_text(payload, "stt_language"),
+        tts_voice=_text(payload, "tts_voice"),
+        voice_runtime_url=_text(payload, "voice_runtime_url"),
     )
 
 
-def read_settings(instance_path: str | Path | None) -> AppSettings:
+def read_settings(instance_path: str | Path | None, filename: str = SETTINGS_FILENAME) -> AppSettings:
     """Read the instance settings, ignoring anything unreadable or malformed."""
     with _STORE_LOCK:
-        return _read_unlocked(_settings_path(instance_path))
+        return _read_unlocked(_settings_path(instance_path, filename))
 
 
-def update_settings(instance_path: str | Path | None, changes: AppSettings) -> AppSettings:
+def update_settings(
+    instance_path: str | Path | None,
+    changes: AppSettings,
+    filename: str = SETTINGS_FILENAME,
+) -> AppSettings:
     """Merge non-None fields of ``changes`` into the stored settings."""
-    path = _settings_path(instance_path)
+    path = _settings_path(instance_path, filename)
     if path is None:
         return changes
 
