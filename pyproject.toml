@@ -18,6 +18,9 @@ dependencies = [
     #Environment variables
     "python-dotenv",
 
+    #Device-gateway signatures. The private key stays outside this repository.
+    "cryptography>=42",
+
     #Instance directory resolution (same convention as the daemon's config dir)
     "platformdirs",
 
