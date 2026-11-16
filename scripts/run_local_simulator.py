@@ -17,6 +17,12 @@ gstreamer_libs.setup_python_environment()
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 sys.path.insert(0, str(SRC))
+# aiortc lives in the WebRTC environment, not the baseline app environment.
+from reachy_mini_conversation_app.voice.pin import webrtc_site_packages
+
+_webrtc_site = webrtc_site_packages()
+if _webrtc_site is not None:
+    sys.path.append(str(_webrtc_site))
 
 import reachy_mini_conversation_app
 from reachy_mini import ReachyMini

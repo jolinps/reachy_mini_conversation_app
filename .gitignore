@@ -7,6 +7,8 @@ __pycache__/
 # Virtual environments
 reachy_mini_env
 .venv/
+.venv-speech/
+.venv-webrtc/
 venv/
 ENV/
 env/

@@ -323,8 +323,26 @@ class LocalStream:
         saved = read_settings(self._instance_path)
         return self._classify_runtime_settings(saved)
 
+    def _conversation_mode(self) -> str:
+        """Return the saved answer path. Only that path is started."""
+        from reachy_mini_conversation_app.voice.pin import conversation_mode
+
+        return conversation_mode(read_settings(self._instance_path).voice_route)
+
     def _apply_supported_runtime_settings(self, saved: AppSettings) -> dict[str, object]:
-        """Reconnect only Hugging Face and speech settings the official runtime owns."""
+        """Reconnect Hugging Face settings, or switch the single active answer path."""
+        from reachy_mini_conversation_app.voice.pin import conversation_mode
+
+        mode = conversation_mode(saved.voice_route)
+        if mode == "huggingface":
+            self._apply_huggingface_settings(saved)
+        live = getattr(self.handler, "conversation_mode", "huggingface")
+        if mode != live:
+            self._mark_restart_requested("conversation_mode_changed")
+        return self._classify_runtime_settings(read_settings(self._instance_path))
+
+    def _apply_huggingface_settings(self, saved: AppSettings) -> None:
+        """Reconnect the hosted Hugging Face session. Hermes Voice does not call this."""
         speech: dict[str, bool] = {}
         if isinstance(saved.local_vad_enabled, bool) and saved.local_vad_enabled != config.LOCAL_VAD_ENABLED:
             speech["local_vad_enabled"] = saved.local_vad_enabled
@@ -351,7 +369,6 @@ class LocalStream:
             self._persist_hf_allocator_connection()
             if self._can_rebuild_handler():
                 self._mark_restart_requested("backend_config_changed")
-        return self._classify_runtime_settings(read_settings(self._instance_path))
 
     def _classify_runtime_settings(self, saved: AppSettings) -> dict[str, object]:
         pending: list[str] = []
@@ -381,7 +398,19 @@ class LocalStream:
             else:
                 pending.append("hf_connection_mode")
         state = "pending_restart" if pending else ("applied" if applied else "unchanged")
-        return {"state": state, "applied_fields": applied, "pending_restart": pending}
+        report: dict[str, object] = {"state": state, "applied_fields": applied, "pending_restart": pending}
+        voice_report = getattr(self.handler, "voice_report", None)
+        if callable(voice_report):
+            report["voice"] = voice_report()
+        elif self._conversation_mode() == "hermes":
+            report["voice"] = {
+                "state": "pending_restart",
+                "applied": False,
+                "active_mode": "huggingface",
+                "webrtc": "not_connected",
+                "live_route": "none",
+            }
+        return report
 
     def _build_handler_for_current_backend(self) -> ConversationHandler:
         """Create and install a fresh handler for the current runtime backend config."""
@@ -672,6 +701,9 @@ class LocalStream:
                 "local_vad_enabled": config.LOCAL_VAD_ENABLED,
                 "local_barge_in_enabled": config.LOCAL_BARGE_IN_ENABLED,
                 "vision_enabled": bool(self._tool_deps and self._tool_deps.camera_enabled),
+                "conversation_mode": getattr(self.handler, "conversation_mode", "huggingface"),
+                "push_to_talk": getattr(self.handler, "conversation_mode", "huggingface") == "hermes",
+                "voice_timing": dict(getattr(self.handler, "last_timing", {}) or {}),
                 **backend_connection,
             }
 
@@ -726,6 +758,23 @@ class LocalStream:
                 self._mic_muted = bool(params["muted"])
                 logger.info("Microphone %s via /rpc", "muted" if self._mic_muted else "unmuted")
             return {"muted": self._mic_muted}
+
+        @rpc.method("conversation.ptt")  # type: ignore[untyped-decorator]
+        async def _rpc_ptt(params: dict[str, object]) -> dict[str, object]:
+            if getattr(self.handler, "conversation_mode", "huggingface") != "hermes":
+                raise JsonRpcError(
+                    "Push-to-talk is part of Hermes Voice.",
+                    reason="ptt_unavailable",
+                    code=-32602,
+                )
+            active = bool(params.get("active"))
+            if active:
+                await self.handler.interrupt()
+            setter = getattr(self.handler, "set_push_to_talk", None)
+            if callable(setter):
+                setter(active)
+            self._mic_muted = not active
+            return {"active": active, "muted": self._mic_muted}
 
         @rpc.method("backend.config")  # type: ignore[untyped-decorator]
         def _rpc_backend_config(params: dict[str, object]) -> dict[str, object]:
@@ -891,6 +940,31 @@ class LocalStream:
                     )
                     await self._sleep_or_restart_requested(self._backend_retry_delay)
                     continue
+
+            if self._conversation_mode() == "hermes":
+                if getattr(self.handler, "conversation_mode", "huggingface") != "hermes":
+                    self._restart_requested.set()
+                    await self._sleep_or_restart_requested(0.2)
+                    continue
+                self._set_backend_connection_state("connecting")
+                try:
+                    await self.handler.start_up()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    self._set_backend_connection_state("disconnected", e)
+                    logger.warning("Hermes Voice failed to start: %s", e)
+                else:
+                    if self._stop_event.is_set():
+                        return
+                    self._set_backend_connection_state("disconnected")
+                await self._sleep_or_restart_requested(self._backend_retry_delay)
+                continue
+
+            if getattr(self.handler, "conversation_mode", "huggingface") != "huggingface":
+                self._restart_requested.set()
+                await self._sleep_or_restart_requested(0.2)
+                continue
 
             if not has_hf_realtime_target():
                 self._set_backend_connection_state(

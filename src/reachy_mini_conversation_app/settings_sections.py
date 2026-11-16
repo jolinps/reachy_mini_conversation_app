@@ -70,7 +70,7 @@ SAVED_ONLY_FIELDS = (
 )
 _ROBOT_MODES = {"physical", "simulator"}
 _VOICE_ROUTES = {"huggingface", "hermes"}
-_SPEECH_PROVIDERS = {"hosted_hf", "external"}
+_SPEECH_PROVIDERS = {"hosted_hf", "external", "parakeet-tdt", "qwen3-asr", "kitten", "qwen3", "pocket"}
 _AGENT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$")
 _HOST = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$")
 _SECRET_KEYS = {
@@ -260,12 +260,12 @@ class SettingsDesk:
                 "existing_controls": EXISTING_CONTROLS,
                 "saved": _public_settings(saved),
                 "applied": {"fields": list(runtime.get("applied_fields") or [])},
-                "pending_apply": _saved_only(saved),
+                "pending_apply": _saved_only(saved, runtime),
                 "pending_restart": list(runtime.get("pending_restart") or []),
                 "application": application,
                 "turn_state": state,
                 "apply_blocked": _busy_reason(activity) is not None,
-                "live_audio_route": "huggingface",
+                "live_audio_route": (runtime.get("voice") or {}).get("live_route") or "huggingface",
                 "statuses": self._statuses(saved, runtime),
                 "robot_test": _public_test(self._robot_result),
                 "agent_test": _public_test(self._agent_result),
@@ -314,10 +314,12 @@ class SettingsDesk:
         if self.runtime_status is None:
             return {"state": "unchanged", "applied_fields": [], "pending_restart": []}
         reported = self.runtime_status() or {}
+        voice = reported.get("voice") if isinstance(reported.get("voice"), dict) else {}
         return {
             "state": reported.get("state") if reported.get("state") in {"unchanged", "applied", "pending_restart"} else "unchanged",
             "applied_fields": [name for name in reported.get("applied_fields") or [] if name in RUNTIME_FIELDS],
             "pending_restart": [name for name in reported.get("pending_restart") or [] if name in RUNTIME_FIELDS],
+            "voice": voice,
         }
 
     def robot_test(self) -> dict[str, Any]:
@@ -468,19 +470,7 @@ class SettingsDesk:
                 "observed_session_profile": None,
                 "agents": self._agents,
             },
-            "voice": {
-                "saved_route": saved.voice_route or "huggingface",
-                "live_route": "huggingface",
-                "route_state": _voice_route_state(saved),
-                "hf_speech": runtime.get("state") or "unchanged",
-                "transport": "unavailable",
-                "webrtc": "not_implemented",
-                "hosted_hf_supports_custom_providers": False,
-                "stt": _provider_status(saved.stt_provider),
-                "tts": _provider_status(saved.tts_provider),
-                "microphone": "unavailable",
-                "speaker": "unavailable",
-            },
+            "voice": _voice_status(saved, runtime),
             "credentials": {
                 "device_identity": identity,
                 "gateway_admin": "server_side",
@@ -511,9 +501,11 @@ def _authorization(agents: list[dict[str, Any]], agent_id: str | None) -> str:
 
 
 def _provider_status(provider: str | None) -> str:
-    if provider in {None, "hosted_hf"}:
-        return "uses_hosted_huggingface_session"
-    return "unavailable"
+    if provider in {None, "", "hosted_hf"}:
+        return "inside_huggingface_conversation"
+    if provider == "external":
+        return "credential_missing"
+    return provider
 
 
 def _identity_status(path: str | None) -> dict[str, Any]:
@@ -559,11 +551,18 @@ def _busy_reason(activity: dict[str, Any]) -> str | None:
     return None
 
 
-def _saved_only(saved: AppSettings) -> list[str]:
-    return [name for name in SAVED_ONLY_FIELDS if getattr(saved, name) is not None]
+def _saved_only(saved: AppSettings, runtime: dict[str, Any] | None = None) -> list[str]:
+    names = [name for name in SAVED_ONLY_FIELDS if getattr(saved, name) is not None]
+    applied = set(((runtime or {}).get("voice") or {}).get("applied_fields") or [])
+    return [name for name in names if name not in applied]
 
 
-def _voice_route_state(saved: AppSettings) -> str:
+def _voice_route_state(saved: AppSettings, voice: dict[str, Any] | None = None) -> str:
+    reported = voice or {}
+    if reported.get("applied") is True and reported.get("active_mode") == "hermes":
+        return "active"
+    if reported.get("state") == "pending_restart":
+        return "pending_restart"
     if (
         saved.voice_route == "hermes"
         or saved.stt_provider == "external"
@@ -574,7 +573,34 @@ def _voice_route_state(saved: AppSettings) -> str:
     return "live_huggingface"
 
 
+def _voice_status(saved: AppSettings, runtime: dict[str, Any]) -> dict[str, Any]:
+    voice = runtime.get("voice") if isinstance(runtime.get("voice"), dict) else {}
+    connected = voice.get("webrtc") == "connected"
+    return {
+        "saved_route": saved.voice_route or "huggingface",
+        "active_route": voice.get("active_mode") or "huggingface",
+        "live_route": voice.get("live_route") or "huggingface",
+        "route_state": _voice_route_state(saved, voice),
+        "hf_speech": runtime.get("state") or "unchanged",
+        "transport": "webrtc" if connected else "unavailable",
+        "webrtc": voice.get("webrtc") or "not_connected",
+        "hosted_hf_supports_custom_providers": False,
+        "saved_stt": saved.stt_provider or "",
+        "saved_tts": saved.tts_provider or "",
+        "stt": voice.get("stt_provider") or _provider_status(saved.stt_provider),
+        "tts": voice.get("tts_provider") or _provider_status(saved.tts_provider),
+        "stt_language": voice.get("stt_language") or saved.stt_language or "",
+        "tts_voice": voice.get("tts_voice") or saved.tts_voice or "",
+        "runtime_url": voice.get("runtime_url") or saved.voice_runtime_url or "",
+        "agent_id": voice.get("agent_id") or saved.gateway_agent_id or "",
+        "credential_blocker": voice.get("credential_blocker") or "",
+        "microphone": "push_to_talk" if connected else "gated",
+        "speaker": "official_playback" if connected else "official_playback",
+    }
+
+
 def _application(saved: AppSettings, runtime: dict[str, Any]) -> dict[str, Any]:
+    voice = runtime.get("voice") if isinstance(runtime.get("voice"), dict) else {}
     return {
         "robot": {
             "state": "saved" if any(getattr(saved, name) is not None for name in ("robot_mode", "robot_host", "robot_port", "robot_name", "robot_advanced_host")) else "unset",
@@ -585,10 +611,18 @@ def _application(saved: AppSettings, runtime: dict[str, Any]) -> dict[str, Any]:
             "applied": False,
         },
         "voice_route": {
-            "state": _voice_route_state(saved),
-            "applied": False,
-            "webrtc": "not_implemented",
-            "live_route": "huggingface",
+            "state": _voice_route_state(saved, voice),
+            "applied": voice.get("applied") is True,
+            "saved_mode": saved.voice_route or "huggingface",
+            "active_mode": voice.get("active_mode") or "huggingface",
+            "webrtc": voice.get("webrtc") or "not_connected",
+            "live_route": voice.get("live_route") or "huggingface",
+            "runtime_url": voice.get("runtime_url") or saved.voice_runtime_url or "",
+            "stt_provider": voice.get("stt_provider") or "",
+            "tts_provider": voice.get("tts_provider") or "",
+            "stt_language": voice.get("stt_language") or "",
+            "tts_voice": voice.get("tts_voice") or "",
+            "agent_id": voice.get("agent_id") or saved.gateway_agent_id or "",
         },
         "hf_speech": {
             "state": runtime.get("state") or "unchanged",

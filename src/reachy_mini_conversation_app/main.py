@@ -206,7 +206,16 @@ def run(
     )
 
     def build_handler(startup_voice: Optional[str] = None) -> ConversationHandler:
-        """Build a Hugging Face realtime handler for the current runtime config."""
+        """Build the one handler selected in settings. The other session is not opened."""
+        from reachy_mini_conversation_app.settings_store import read_settings
+        from reachy_mini_conversation_app.voice.pin import conversation_mode
+
+        if conversation_mode(read_settings(instance_path).voice_route) == "hermes":
+            from reachy_mini_conversation_app.voice.hermes_handler import HermesVoiceHandler
+
+            logger.info("Using Hermes Voice. The hosted Hugging Face conversation model will not start.")
+            return HermesVoiceHandler(deps, instance_path=instance_path, startup_voice=startup_voice)
+
         from reachy_mini_conversation_app.huggingface_realtime import HuggingFaceRealtimeHandler
 
         hf_connection_selection = get_hf_connection_selection()

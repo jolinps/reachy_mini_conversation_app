@@ -174,6 +174,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         """Initialize the handler."""
         super().__init__()
 
+        self.conversation_mode = "huggingface"
         self.deps = deps
 
         self.client: AsyncOpenAI

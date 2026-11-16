@@ -216,20 +216,23 @@ export function buildExperimentalVoice(connectionElement) {
   const route = h(
     "select",
     { class: "settings-select", name: "voice_route" },
-    h("option", { value: "huggingface" }, "Hugging Face baseline"),
-    h("option", { value: "hermes" }, "Hermes voice (not connected)")
+    h("option", { value: "huggingface" }, "Hugging Face Conversation"),
+    h("option", { value: "hermes" }, "Hermes Voice")
   );
   const stt = h(
     "select",
     { class: "settings-select", name: "stt_provider" },
-    h("option", { value: "hosted_hf" }, "Hosted Hugging Face session"),
-    h("option", { value: "external" }, "Separate STT provider")
+    h("option", { value: "parakeet-tdt" }, "Parakeet TDT (English and European)"),
+    h("option", { value: "qwen3-asr" }, "Qwen3-ASR (includes Thai, not Burmese)"),
+    h("option", { value: "external" }, "External STT (credential required)")
   );
   const tts = h(
     "select",
     { class: "settings-select", name: "tts_provider" },
-    h("option", { value: "hosted_hf" }, "Hosted Hugging Face session"),
-    h("option", { value: "external" }, "Separate TTS provider")
+    h("option", { value: "kitten" }, "Kitten TTS (English)"),
+    h("option", { value: "qwen3" }, "Qwen3-TTS"),
+    h("option", { value: "pocket" }, "Pocket TTS"),
+    h("option", { value: "external" }, "External TTS (credential required)")
   );
   const language = h("input", { class: "settings-input", name: "stt_language", placeholder: "en" });
   const voice = h("input", { class: "settings-input", name: "tts_voice", placeholder: "Provider voice id" });
@@ -238,14 +241,14 @@ export function buildExperimentalVoice(connectionElement) {
   const form = h(
     "form",
     { class: "settings-form" },
-    h("p", { class: "settings-hint" }, "The hosted Hugging Face session does not accept a custom Hermes backend or separate STT and TTS credentials."),
+    h("p", { class: "settings-hint" }, "Hugging Face Conversation keeps the current session. Hermes Voice uses the local speech runtime for STT and TTS, then the authenticated gateway for the answer. The hosted conversation model does not run in that mode and is not an STT or TTS service."),
     field("Voice route", route),
     field("STT provider", stt),
     field("TTS provider", tts),
     field("STT language", language),
     field("TTS voice", voice),
     field("Voice-runtime URL", runtime),
-    h("p", { class: "settings-hint" }, "Microphone and speaker selection is unavailable. WebRTC is not implemented. Microphone-level and speaker-playback tests stay off so this page does not open the baseline session's devices."),
+    h("p", { class: "settings-hint" }, "Hermes Voice connects to the speech runtime over WebRTC. The robot microphone and speaker stay on the official media path. Hold the orb to talk. Thai and Burmese need a provider that is not running yet."),
     h(
       "div",
       { class: "settings-actions" },
@@ -285,15 +288,16 @@ export function buildExperimentalVoice(connectionElement) {
     sync(snapshot) {
       const saved = snapshot?.saved || {};
       route.value = saved.voice_route || "huggingface";
-      stt.value = saved.stt_provider || "hosted_hf";
-      tts.value = saved.tts_provider || "hosted_hf";
+      stt.value = saved.stt_provider && saved.stt_provider !== "hosted_hf" ? saved.stt_provider : "parakeet-tdt";
+      tts.value = saved.tts_provider && saved.tts_provider !== "hosted_hf" ? saved.tts_provider : "kitten";
       language.value = saved.stt_language || "";
       voice.value = saved.tts_voice || "";
       runtime.value = saved.voice_runtime_url || "";
       const voiceStatus = snapshot?.statuses?.voice || {};
-      const routeState = snapshot?.application?.voice_route?.state || voiceStatus.route_state || "live_huggingface";
+      const active = snapshot?.application?.voice_route || {};
+      const blocker = voiceStatus.credential_blocker ? ` ${voiceStatus.credential_blocker}` : "";
       form.querySelector("[data-role=voice-status]").textContent =
-        `Live route ${voiceStatus.live_route || "huggingface"}. Saved route ${voiceStatus.saved_route || "huggingface"} (${routeState}). Transport ${voiceStatus.transport || "unavailable"}. WebRTC ${voiceStatus.webrtc || "not_implemented"}. STT ${voiceStatus.stt || "unavailable"}. TTS ${voiceStatus.tts || "unavailable"}.`;
+        `Saved ${voiceStatus.saved_route || "huggingface"}. Active ${active.active_mode || voiceStatus.active_route || "huggingface"} (${voiceStatus.route_state || "live_huggingface"}). Runtime ${voiceStatus.runtime_url || "unset"}. WebRTC ${voiceStatus.webrtc || "not_connected"}. Active STT ${voiceStatus.stt || "unset"} ${voiceStatus.stt_language || ""}. Active TTS ${voiceStatus.tts || "unset"} ${voiceStatus.tts_voice || ""}. Agent ${voiceStatus.agent_id || "unset"}.${blocker}`;
     },
   };
 }
@@ -306,7 +310,7 @@ export function buildConversationIntro() {
     h(
       "p",
       { class: "settings-hint" },
-      "Personalities are application characters. They are not Hermes profiles. Local speech detection and barge-in affect the running Hugging Face session. The Hermes voice route does not use them until that runtime exists."
+      "Personalities are application characters. They are not Hermes profiles. Local speech detection and barge-in belong to Hugging Face Conversation. Hermes Voice uses push-to-talk and does not send partial transcripts to tools."
     )
   );
 }
@@ -395,13 +399,18 @@ async function apply(status) {
   status.textContent = "Applying…";
   try {
     const snapshot = await applySettings();
+    const voice = snapshot.application?.voice_route || {};
     const speech = snapshot.application?.hf_speech?.state;
-    if (speech === "pending_restart") {
-      status.textContent = "Hugging Face or speech settings are reconnecting. Robot, gateway, and Hermes voice were not applied.";
+    if (voice.applied) {
+      status.textContent = "Hermes Voice is the active answer path. Robot and gateway addresses were not retargeted.";
+    } else if (voice.state === "pending_restart") {
+      status.textContent = "Hermes Voice is saved. It becomes active when the speech runtime is connected and the saved providers match it.";
+    } else if (speech === "pending_restart") {
+      status.textContent = "Hugging Face Conversation is reconnecting. Robot and gateway addresses were not applied.";
     } else if (speech === "applied") {
-      status.textContent = "Hugging Face and speech settings match the running session. Robot, gateway, and Hermes voice were not applied.";
+      status.textContent = "Hugging Face Conversation matches the running session. Robot and gateway addresses were not applied.";
     } else {
-      status.textContent = "Saved values were not applied to the live session. Hermes voice and WebRTC remain unavailable.";
+      status.textContent = "Saved values were not applied to the live session.";
     }
   } catch (error) {
     fail(status, error);

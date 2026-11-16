@@ -4,7 +4,7 @@
  * Robot stays live, tapping the orb only mutes or unmutes the user's mic.
  */
 
-import { applyPersonality, getMicState, listPersonalities, setMicMuted, subscribe } from "../api.js";
+import { applyPersonality, getConversationStatus, getMicState, listPersonalities, setMicMuted, setPushToTalk, subscribe } from "../api.js";
 import { createConversationPanel } from "../components/conversation-panel.js";
 import { createLanguagePicker } from "../components/language-picker.js";
 import { ORB_STATES } from "../constants.js";
@@ -62,7 +62,35 @@ export async function mountTalkView({ outlet, signal }) {
     },
   });
   orb.root.disabled = true;
-  orb.root.addEventListener("click", onMicTap);
+  const talkStatus = await getConversationStatus().catch(() => null);
+  const pushToTalk = talkStatus?.push_to_talk === true;
+  if (pushToTalk) {
+    let holding = false;
+    const hold = async (active) => {
+      if (!micReady || holding === active) return;
+      holding = active;
+      try {
+        const data = await setPushToTalk(active);
+        muted = Boolean(data?.muted);
+      } catch (error) {
+        if (!signal.aborted) caption.textContent = `Failed to talk: ${error?.message || error}`;
+        holding = false;
+        return;
+      }
+      if (signal.aborted) return;
+      orb.setState(active ? ORB_STATES.LISTENING : restingState());
+      caption.textContent = active ? "Listening" : "Hold to talk";
+      syncMicAria();
+    };
+    orb.root.addEventListener("pointerdown", (event) => {
+      event.preventDefault();
+      void hold(true);
+    });
+    orb.root.addEventListener("pointerup", () => void hold(false));
+    orb.root.addEventListener("pointercancel", () => void hold(false));
+  } else {
+    orb.root.addEventListener("click", onMicTap);
+  }
   syncMicAria();
   const conversationPanel = createConversationPanel({
     toggle: document.querySelector('[data-component="conversation-toggle"]'),
@@ -103,6 +131,7 @@ export async function mountTalkView({ outlet, signal }) {
   if (signal.aborted) return;
   micReady = true;
   orb.root.disabled = false;
+  if (pushToTalk && muted) caption.textContent = "Hold to talk";
   syncMicAria();
 
   subscription = subscribeConversationEvents({

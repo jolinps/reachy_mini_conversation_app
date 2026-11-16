@@ -29,7 +29,7 @@ class BoundTurn:
         self.agent_id = ""
         self.epoch = -1
 
-    def send(self, text: str, should_stop=None) -> dict:
+    def send(self, text: str, should_stop=None, on_delta=None) -> dict:
         if not text.strip():
             raise GatewayError("The text request was empty.", "configuration")
         if not self.agent_id:
@@ -59,6 +59,7 @@ class BoundTurn:
                         stopped = True
                         break
                     self._require_same_agent(event, agent_id)
+                    self._emit_delta(event, on_delta)
                 if stopped:
                     break
             if not stopped:
@@ -97,6 +98,15 @@ class BoundTurn:
                 "The gateway answered from a different agent. The answer was discarded.",
                 "mismatch",
             )
+
+    @staticmethod
+    def _emit_delta(event: dict, on_delta) -> None:
+        """Forward a non-final text delta. The final event is the whole answer."""
+        if on_delta is None or event.get("type") != "response_text" or event.get("final") is True:
+            return
+        text = event.get("text")
+        if isinstance(text, str) and text:
+            on_delta(text)
 
     def _stop_requested(self, should_stop) -> bool:
         return should_stop is not None and should_stop()

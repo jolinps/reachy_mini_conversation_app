@@ -138,8 +138,10 @@ export const applyPersonality = (name, { persist = false, force = false } = {}) 
 export const deletePersonality = (name) => rpcCall("personalities.delete", { name });
 
 export const getConversationHistory = () => rpcCall("conversation.history");
+export const getConversationStatus = () => rpcCall("conversation.status");
 export const getMicState = () => rpcCall("conversation.mic", {});
 export const setMicMuted = (muted) => rpcCall("conversation.mic", { muted });
+export const setPushToTalk = (active) => rpcCall("conversation.ptt", { active });
 
 export const listVoices = () => rpcCall("voices.list");
 export const getCurrentVoice = () => rpcCall("voices.current");
@@ -188,7 +190,8 @@ const ERROR_MESSAGES = Object.freeze({
   invalid_robot_host: "Enter a host name or address without a login.",
   invalid_robot_port: "Enter a port from 1 to 65535.",
   invalid_gateway_url: "Enter an https gateway address.",
-  invalid_voice_route: "Choose the Hugging Face baseline or the Hermes voice route.",
+  invalid_voice_route: "Choose Hugging Face Conversation or Hermes Voice.",
+  ptt_unavailable: "Push-to-talk is part of Hermes Voice.",
   apply_during_turn: "A turn is in progress. Apply the connection after it finishes.",
   apply_during_playback: "Audio is still playing. Apply the connection after it finishes.",
   apply_during_tool: "A tool is still running. Apply the connection after it finishes.",
